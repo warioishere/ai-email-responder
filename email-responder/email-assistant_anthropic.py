@@ -650,6 +650,93 @@ class EmailAssistant:
 
         return None
 
+    def find_email_by_recipient_subject(self, recipient: str, subject: str) -> Optional[Dict]:
+        """Find an email by recipient (From field) and subject keywords in the INBOX.
+        Used as fallback when Message-ID search fails."""
+        try:
+            self.imap.select('INBOX')
+            # Search for emails FROM the recipient
+            _, result = self.imap.search(None, f'FROM "{recipient}"')
+
+            if not result[0]:
+                return None
+
+            email_ids = result[0].split()
+            # Search through the found emails for subject match
+            for email_id in email_ids[-50:]:  # Check last 50 emails from this sender
+                try:
+                    _, msg_data = self.imap.fetch(email_id, '(RFC822)')
+                    email_body = msg_data[0][1]
+                    email_message = email.message_from_bytes(email_body)
+
+                    # Decode the subject
+                    raw_subject = (email_message['Subject'] or '').replace('\n', ' ').replace('\r', ' ').strip()
+                    decoded_subject = self.decode_mime_header(raw_subject)
+
+                    # Check if important keywords from sent subject are in original subject
+                    # Extract order number if present (e.g., "Nr. 19530")
+                    import re
+                    order_match = re.search(r'Nr\.\s+(\d+)', subject)
+                    if order_match:
+                        order_num = order_match.group(1)
+                        if order_num in decoded_subject:
+                            print(f"    Found original email by recipient+order: {decoded_subject}")
+                            # Extract content
+                            content = ''
+                            if email_message.is_multipart():
+                                for part in email_message.walk():
+                                    if part.get_content_type() == "text/plain":
+                                        try:
+                                            payload = part.get_payload(decode=True)
+                                            if payload:
+                                                try:
+                                                    content += payload.decode('utf-8')
+                                                except UnicodeDecodeError:
+                                                    for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
+                                                        try:
+                                                            content += payload.decode(encoding)
+                                                            break
+                                                        except UnicodeDecodeError:
+                                                            continue
+                                                    else:
+                                                        content += payload.decode('utf-8', errors='ignore')
+                                        except:
+                                            pass
+                            else:
+                                try:
+                                    payload = email_message.get_payload(decode=True)
+                                    if payload:
+                                        try:
+                                            content = payload.decode('utf-8')
+                                        except UnicodeDecodeError:
+                                            for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
+                                                try:
+                                                    content = payload.decode(encoding)
+                                                    break
+                                                except UnicodeDecodeError:
+                                                    continue
+                                            else:
+                                                content = payload.decode('utf-8', errors='ignore')
+                                    else:
+                                        content = ''
+                                except:
+                                    content = ''
+
+                            sender = email.utils.parseaddr(email_message['From'])[1]
+                            return {
+                                'sender': sender,
+                                'subject': decoded_subject,
+                                'content': content,
+                                'message_id': email_message.get('Message-ID', '')
+                            }
+                except Exception as e:
+                    continue
+
+            return None
+        except Exception as e:
+            print(f"Error finding email by recipient+subject: {e}")
+            return None
+
     def learn_from_sent_emails(self):
         """Check Sent folder and learn from emails that match our drafts."""
         sent_folders = ['Sent', 'INBOX.Sent', '[Gmail]/Sent Mail', 'Sent Items']
@@ -794,6 +881,12 @@ class EmailAssistant:
 
                                 # Try to find the original email and learn from it
                                 original_email = self.find_email_by_message_id(in_reply_to)
+
+                                # If Message-ID search fails, try fallback search by recipient + subject
+                                if not original_email:
+                                    print(f"    Message-ID search failed, trying fallback search by recipient+subject")
+                                    original_email = self.find_email_by_recipient_subject(recipient, subject)
+
                                 if original_email:
                                     print(f"    Found original email from {original_email['sender']}")
 
@@ -817,7 +910,16 @@ class EmailAssistant:
 
                                         learned_count += 1
                                 else:
-                                    print(f"    Could not find original email with Message-ID: {in_reply_to}")
+                                    print(f"    Could not find original email (tried Message-ID and recipient+subject searches)")
+                                    # Last resort: Save conversation history with just the recipient
+                                    # This ensures at least we have context for future replies
+                                    print(f"    Saving basic conversation history with recipient: {recipient}")
+                                    basic_email_data = {
+                                        'sender': recipient,
+                                        'subject': subject,
+                                        'content': f"[Order confirmation or filtered email - original not found]\n{subject}"
+                                    }
+                                    self.update_history(basic_email_data, content)
 
                         if matched_draft:
                             # Found a match! Learn from the sent email
