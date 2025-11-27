@@ -651,85 +651,97 @@ class EmailAssistant:
         return None
 
     def find_email_by_recipient_subject(self, recipient: str, subject: str) -> Optional[Dict]:
-        """Find an email by recipient (From field) and subject keywords in the INBOX.
+        """Find original email by searching for order number in subject across multiple folders.
         Used as fallback when Message-ID search fails."""
         try:
-            self.imap.select('INBOX')
-            # Search for emails FROM the recipient
-            _, result = self.imap.search(None, f'FROM "{recipient}"')
-
-            if not result[0]:
+            # Extract order number from subject (e.g., "Nr. 19530")
+            import re
+            order_match = re.search(r'Nr\.\s+(\d+)', subject)
+            if not order_match:
                 return None
 
-            email_ids = result[0].split()
-            # Search through the found emails for subject match
-            for email_id in email_ids[-50:]:  # Check last 50 emails from this sender
+            order_num = order_match.group(1)
+            print(f"    Searching for order {order_num} in multiple folders...")
+
+            # Search in multiple folders
+            folders_to_check = ['INBOX', 'Archive', 'Sent', 'INBOX.Archive']
+
+            for folder in folders_to_check:
                 try:
-                    _, msg_data = self.imap.fetch(email_id, '(RFC822)')
-                    email_body = msg_data[0][1]
-                    email_message = email.message_from_bytes(email_body)
+                    self.imap.select(folder)
+                    # Search for emails containing the order number in subject
+                    _, result = self.imap.search(None, f'SUBJECT "{order_num}"')
 
-                    # Decode the subject
-                    raw_subject = (email_message['Subject'] or '').replace('\n', ' ').replace('\r', ' ').strip()
-                    decoded_subject = self.decode_mime_header(raw_subject)
+                    if not result[0]:
+                        continue
 
-                    # Check if important keywords from sent subject are in original subject
-                    # Extract order number if present (e.g., "Nr. 19530")
-                    import re
-                    order_match = re.search(r'Nr\.\s+(\d+)', subject)
-                    if order_match:
-                        order_num = order_match.group(1)
-                        if order_num in decoded_subject:
-                            print(f"    Found original email by recipient+order: {decoded_subject}")
-                            # Extract content
-                            content = ''
-                            if email_message.is_multipart():
-                                for part in email_message.walk():
-                                    if part.get_content_type() == "text/plain":
-                                        try:
-                                            payload = part.get_payload(decode=True)
-                                            if payload:
-                                                try:
-                                                    content += payload.decode('utf-8')
-                                                except UnicodeDecodeError:
-                                                    for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
-                                                        try:
-                                                            content += payload.decode(encoding)
-                                                            break
-                                                        except UnicodeDecodeError:
-                                                            continue
-                                                    else:
-                                                        content += payload.decode('utf-8', errors='ignore')
-                                        except:
-                                            pass
-                            else:
-                                try:
-                                    payload = email_message.get_payload(decode=True)
-                                    if payload:
-                                        try:
-                                            content = payload.decode('utf-8')
-                                        except UnicodeDecodeError:
-                                            for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
-                                                try:
-                                                    content = payload.decode(encoding)
-                                                    break
-                                                except UnicodeDecodeError:
-                                                    continue
-                                            else:
-                                                content = payload.decode('utf-8', errors='ignore')
-                                    else:
+                    email_ids = result[0].split()
+                    # Check the most recent emails
+                    for email_id in email_ids[-20:]:
+                        try:
+                            _, msg_data = self.imap.fetch(email_id, '(RFC822)')
+                            email_body = msg_data[0][1]
+                            email_message = email.message_from_bytes(email_body)
+
+                            # Decode the subject
+                            raw_subject = (email_message['Subject'] or '').replace('\n', ' ').replace('\r', ' ').strip()
+                            decoded_subject = self.decode_mime_header(raw_subject)
+
+                            # Verify it's the right order by checking order number is in subject
+                            if order_num in decoded_subject and 'Bestellung' in decoded_subject:
+                                print(f"    Found original email in {folder}: {decoded_subject}")
+                                # Extract content
+                                content = ''
+                                if email_message.is_multipart():
+                                    for part in email_message.walk():
+                                        if part.get_content_type() == "text/plain":
+                                            try:
+                                                payload = part.get_payload(decode=True)
+                                                if payload:
+                                                    try:
+                                                        content += payload.decode('utf-8')
+                                                    except UnicodeDecodeError:
+                                                        for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
+                                                            try:
+                                                                content += payload.decode(encoding)
+                                                                break
+                                                            except UnicodeDecodeError:
+                                                                continue
+                                                        else:
+                                                            content += payload.decode('utf-8', errors='ignore')
+                                            except:
+                                                pass
+                                else:
+                                    try:
+                                        payload = email_message.get_payload(decode=True)
+                                        if payload:
+                                            try:
+                                                content = payload.decode('utf-8')
+                                            except UnicodeDecodeError:
+                                                for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
+                                                    try:
+                                                        content = payload.decode(encoding)
+                                                        break
+                                                    except UnicodeDecodeError:
+                                                        continue
+                                                else:
+                                                    content = payload.decode('utf-8', errors='ignore')
+                                        else:
+                                            content = ''
+                                    except:
                                         content = ''
-                                except:
-                                    content = ''
 
-                            sender = email.utils.parseaddr(email_message['From'])[1]
-                            return {
-                                'sender': sender,
-                                'subject': decoded_subject,
-                                'content': content,
-                                'message_id': email_message.get('Message-ID', '')
-                            }
+                                sender = email.utils.parseaddr(email_message['From'])[1]
+                                return {
+                                    'sender': sender,
+                                    'subject': decoded_subject,
+                                    'content': content,
+                                    'message_id': email_message.get('Message-ID', '')
+                                }
+                        except Exception as e:
+                            continue
                 except Exception as e:
+                    # Failed to search this folder, try next one
                     continue
 
             return None
