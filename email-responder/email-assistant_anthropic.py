@@ -836,7 +836,11 @@ class EmailAssistant:
                             except:
                                 content = ''
 
-                        recipient = email.utils.parseaddr(email_message['To'])[1]
+                        # Decode the To header (may be MIME encoded)
+                        raw_to = (email_message['To'] or '').replace('\n', ' ').replace('\r', ' ').strip()
+                        decoded_to = self.decode_mime_header(raw_to)
+                        recipient = email.utils.parseaddr(decoded_to)[1]
+
                         raw_subject = (email_message['Subject'] or '').replace('\n', ' ').replace('\r', ' ').strip()
                         # Decode MIME encoded headers
                         subject = self.decode_mime_header(raw_subject)
