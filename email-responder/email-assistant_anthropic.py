@@ -1112,30 +1112,38 @@ Grund: {reason}
             print("No article index found (run article indexer to create one)")
 
     def _find_relevant_articles(self, email_data: Dict, max_results: int = 5) -> str:
-        """Find relevant articles based on email subject and content using keyword matching."""
-        if not self._article_index:
+        """Find relevant articles based on email subject and content using keyword matching
+        against article titles, headings, and categories."""
+        if not self._article_index or not self.config.get('article_linking_enabled', True):
             return ""
 
         subject = email_data.get('subject', '').lower()
         content = email_data.get('content', '')[:500].lower()
         search_text = f"{subject} {content}"
+        search_words = set(re.findall(r'\w{4,}', search_text))
 
-        # Score each article by keyword overlap
+        if not search_words:
+            return ""
+
         scored = []
         for article in self._article_index:
-            title_lower = article['title'].lower()
-            title_words = set(re.findall(r'\w{4,}', title_lower))
-            search_words = set(re.findall(r'\w{4,}', search_text))
+            score = 0
 
-            # Count matching words
-            overlap = title_words & search_words
-            # Boost for category match
+            # Title match (highest weight)
+            title_words = set(re.findall(r'\w{4,}', article['title'].lower()))
+            score += len(title_words & search_words) * 3
+
+            # Headings match (good signal)
+            for heading in article.get('headings', []):
+                heading_words = set(re.findall(r'\w{4,}', heading.lower()))
+                score += len(heading_words & search_words)
+
+            # Category match
             cat_text = ' '.join(article.get('categories', [])).lower()
             cat_words = set(re.findall(r'\w{4,}', cat_text))
-            cat_overlap = cat_words & search_words
+            score += len(cat_words & search_words)
 
-            score = len(overlap) * 2 + len(cat_overlap)
-            if score > 0:
+            if score > 1:  # Minimum 2 keyword matches to avoid noise
                 scored.append((score, article))
 
         if not scored:
