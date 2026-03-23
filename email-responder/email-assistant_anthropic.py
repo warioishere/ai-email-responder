@@ -24,6 +24,7 @@ class EmailAssistant:
         self.load_history()
         self.load_learned_spam()
         self.load_draft_tracking()
+        self._load_article_index()
 
     def load_config(self, config_path: str):
         """Load configuration from YAML file."""
@@ -1097,6 +1098,61 @@ Grund: {reason}
 
     # ---- End Matrix Integration ----
 
+    # ---- Article Index ----
+
+    def _load_article_index(self):
+        """Load the article index from memory/article_index.json"""
+        index_path = os.path.join('memory', 'article_index.json')
+        try:
+            with open(index_path, 'r') as f:
+                self._article_index = json.load(f)
+            print(f"Article index loaded: {len(self._article_index)} articles")
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._article_index = []
+            print("No article index found (run article indexer to create one)")
+
+    def _find_relevant_articles(self, email_data: Dict, max_results: int = 5) -> str:
+        """Find relevant articles based on email subject and content using keyword matching."""
+        if not self._article_index:
+            return ""
+
+        subject = email_data.get('subject', '').lower()
+        content = email_data.get('content', '')[:500].lower()
+        search_text = f"{subject} {content}"
+
+        # Score each article by keyword overlap
+        scored = []
+        for article in self._article_index:
+            title_lower = article['title'].lower()
+            title_words = set(re.findall(r'\w{4,}', title_lower))
+            search_words = set(re.findall(r'\w{4,}', search_text))
+
+            # Count matching words
+            overlap = title_words & search_words
+            # Boost for category match
+            cat_text = ' '.join(article.get('categories', [])).lower()
+            cat_words = set(re.findall(r'\w{4,}', cat_text))
+            cat_overlap = cat_words & search_words
+
+            score = len(overlap) * 2 + len(cat_overlap)
+            if score > 0:
+                scored.append((score, article))
+
+        if not scored:
+            return ""
+
+        # Sort by score, take top results
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = scored[:max_results]
+
+        result = "Relevante Artikel von yourdevice.ch (verweise den Kunden darauf wenn passend):\n"
+        for score, article in top:
+            result += f"- {article['title']}: {article['url']}\n"
+
+        return result
+
+    # ---- End Article Index ----
+
     def generate_response(self, email_data: Dict) -> str:
         """Generate response using Claude API."""
         try:
@@ -1124,10 +1180,15 @@ Inhalt: {email_data['content']}"""
             # Get recent email activity for broader context
             recent_context = self._get_recent_emails_context(days=10)
 
+            # Find relevant articles
+            articles_context = self._find_relevant_articles(email_data)
+
             # Combine all context
             full_context = f"Bisherige Konversation mit diesem Absender:\n{history_context}"
             if recent_context:
                 full_context += f"\n\n{recent_context}"
+            if articles_context:
+                full_context += f"\n\n{articles_context}"
             full_context += f"\n\nNeue Email beantworten:\n{email_context}"
 
             response = self.anthropic.messages.create(
