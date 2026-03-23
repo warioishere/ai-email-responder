@@ -19,3 +19,11 @@ system_prompt: |
   2. Address all points in the original email
   3. Be concise but thorough
   4. Sign off appropriately
+# Triage settings - classify emails before generating drafts
+triage_enabled: true                    # Set to false to disable triage (old behavior)
+triage_confidence_threshold: 0.7        # Below this confidence, email goes to human review
+# Matrix integration - notifications for emails needing human review
+matrix_enabled: true
+matrix_homeserver: "https://matrix.example.com"
+matrix_access_token: "your-access-token"
+matrix_room_id: "!roomid:matrix.example.com"

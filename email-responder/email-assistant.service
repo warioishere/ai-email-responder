@@ -1,0 +1,15 @@
+[Unit]
+Description=Email Assistant Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=warioishere
+WorkingDirectory=/home/warioishere/programme/email-responder
+ExecStart=/home/warioishere/programme/email-responder/.venv/bin/python3 email-assistant_anthropic.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+config.yaml
+*.bak
+.venv/
+__pycache__/
+memory/
+*.json
+!config.example.yaml
