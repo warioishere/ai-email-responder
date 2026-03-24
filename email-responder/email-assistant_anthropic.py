@@ -658,34 +658,81 @@ Has existing conversation: {has_history}"""
                 pass
             return {'category': 'needs_human', 'confidence': 0.0, 'reason': f'Classification error: {str(e)}'}
 
-    def _save_pending_decision(self, email_data: Dict, triage: Dict):
-        """Save an email that needs human decision to memory/categories/pending_decisions.json"""
-        categories_dir = os.path.join('memory', 'categories')
-        os.makedirs(categories_dir, exist_ok=True)
-        filepath = os.path.join(categories_dir, 'pending_decisions.json')
-
+    def _load_pending(self) -> Dict:
+        """Load pending items dict from file. Migrates old list format automatically."""
+        filepath = os.path.join('memory', 'categories', 'pending_decisions.json')
         try:
             with open(filepath, 'r') as f:
-                decisions = json.load(f)
+                data = json.load(f)
+            if isinstance(data, list):
+                # Migrate old list format to UUID-keyed dict
+                new_data = {}
+                for item in data:
+                    pid = item.get('id') or uuid.uuid4().hex[:6]
+                    item['id'] = pid
+                    if 'content' not in item:
+                        item['content'] = item.pop('content_preview', '')
+                    if 'draft' not in item:
+                        item['draft'] = None
+                    new_data[pid] = item
+                self._save_pending(new_data)
+                return new_data
+            return data
         except (FileNotFoundError, json.JSONDecodeError):
-            decisions = []
+            return {}
 
-        decisions.append({
-            'timestamp': datetime.now().isoformat(),
+    def _save_pending(self, pending: Dict):
+        """Save pending items dict to file."""
+        os.makedirs(os.path.join('memory', 'categories'), exist_ok=True)
+        filepath = os.path.join('memory', 'categories', 'pending_decisions.json')
+        with open(filepath, 'w') as f:
+            json.dump(pending, f, indent=2, ensure_ascii=False)
+
+    def _save_pending_decision(self, email_data: Dict, triage: Dict) -> str:
+        """Save email needing human decision. Returns the pending ID."""
+        pending = self._load_pending()
+        pid = uuid.uuid4().hex[:6]
+        pending[pid] = {
+            'id': pid,
+            'type': 'decision',
             'sender': email_data['sender'],
             'subject': email_data['subject'],
-            'content_preview': email_data['content'][:300] if email_data['content'] else '',
+            'content': (email_data.get('content') or '')[:2000],
             'message_id': email_data.get('message_id', ''),
             'triage_category': triage['category'],
             'triage_confidence': triage['confidence'],
             'triage_reason': triage.get('reason', ''),
+            'draft': None,
+            'appointment_stage': None,
+            'created': datetime.now().isoformat(),
             'resolved': False
-        })
+        }
+        self._save_pending(pending)
+        print(f"  Saved to pending [{pid}]: {triage['category']} - {triage.get('reason', '')}")
+        return pid
 
-        with open(filepath, 'w') as f:
-            json.dump(decisions, f, indent=2, ensure_ascii=False)
-
-        print(f"  Saved to pending decisions: {triage['category']} - {triage.get('reason', '')}")
+    def _save_pending_draft(self, email_data: Dict, draft: str) -> str:
+        """Save auto-generated draft to pending for confirmation. Returns pending ID."""
+        pending = self._load_pending()
+        pid = uuid.uuid4().hex[:6]
+        clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', draft).strip()
+        pending[pid] = {
+            'id': pid,
+            'type': 'draft',
+            'sender': email_data['sender'],
+            'subject': email_data['subject'],
+            'content': (email_data.get('content') or '')[:2000],
+            'message_id': email_data.get('message_id', ''),
+            'triage_category': email_data.get('triage', {}).get('category', 'quick_answer'),
+            'draft': clean,
+            'draft_raw': draft,
+            'appointment_stage': None,
+            'created': datetime.now().isoformat(),
+            'resolved': False
+        }
+        self._save_pending(pending)
+        print(f"  Saved pending draft [{pid}] for {email_data['sender']}")
+        return pid
 
     def _update_contact_from_triage(self, email_data: Dict, triage: Dict):
         """Update contact profile with triage information (category tags, topics)."""
@@ -765,41 +812,63 @@ Has existing conversation: {has_history}"""
         result = self._matrix_request('PUT', endpoint, content)
         return result is not None
 
-    def _matrix_notify_pending(self, email_data: Dict, triage: Dict):
-        """Send a Matrix notification for emails that need human review."""
-        # Get the number of this pending decision
-        try:
-            cat_dir = os.path.join('memory', 'categories')
-            with open(os.path.join(cat_dir, 'pending_decisions.json'), 'r') as f:
-                all_decisions = json.load(f)
-            pending_num = len([d for d in all_decisions if not d.get('resolved', False)])
-        except:
-            pending_num = '?'
-
+    def _matrix_notify_pending(self, email_data: Dict, triage: Dict, pending_id: str = None):
+        """Send Matrix notification for email needing human review."""
         category = triage['category']
-        emoji = {"needs_human": "\u2753", "appointment_request": "\U0001f4c5"}.get(category, "\U0001f4e7")
+        emoji = {"needs_human": "❓", "appointment_request": "📅"}.get(category, "📧")
         sender = email_data['sender']
         subject = email_data['subject']
         reason = triage.get('reason', '')
+        content = (email_data.get('content') or '')[:600]
+        pid = pending_id or '?'
 
-        text = f"""{emoji} [{pending_num}] {category.upper()}
-Von: {sender}
-Betreff: {subject}
-Grund: {reason}
+        text = (f"{emoji} [{pid}] {category.upper()}\n"
+                f"Von: {sender}\n"
+                f"Betreff: {subject}\n"
+                f"Grund: {reason}\n\n"
+                f"Email:\n{content}\n\n"
+                f"{pid} draft | {pid} call | {pid} zeit [wann] | {pid} antwort [text] | {pid} spam | {pid} ignore")
 
-!status für aktuelle Nummern | N draft | N call | N zeit [wann] | N antwort [text] | N spam | N ignore"""
-
-        html = f"""<b>{emoji} [{pending_num}] {category.upper()}</b><br/>
-<b>Von:</b> {sender}<br/>
-<b>Betreff:</b> {subject}<br/>
-<b>Grund:</b> {reason}<br/>
-<br/>
-<code>!status</code> für aktuelle Nummern | <code>N draft</code> | <code>N call</code> | <code>N zeit [wann]</code> | <code>N antwort [text]</code> | <code>N spam</code> | <code>N ignore</code>"""
+        html = (f"<b>{emoji} [{pid}] {category.upper()}</b><br/>"
+                f"<b>Von:</b> {sender}<br/>"
+                f"<b>Betreff:</b> {subject}<br/>"
+                f"<b>Grund:</b> <i>{reason}</i><br/><br/>"
+                f"<b>Email:</b><br/><pre>{content}</pre><br/>"
+                f"<code>{pid} draft</code> | <code>{pid} call</code> | <code>{pid} zeit [wann]</code> | "
+                f"<code>{pid} antwort [text]</code> | <code>{pid} spam</code> | <code>{pid} ignore</code>")
 
         if self._matrix_send_message(text, html):
-            print(f"  Matrix notification sent for {sender}")
+            print(f"  Matrix notification sent for {sender} [{pid}]")
         else:
             print(f"  Failed to send Matrix notification for {sender}")
+
+    def _matrix_notify_draft(self, email_data: Dict, draft: str, pending_id: str):
+        """Send Matrix notification with auto-generated draft for confirmation."""
+        sender = email_data['sender']
+        subject = email_data['subject']
+        content = (email_data.get('content') or '')[:400]
+        cat = email_data.get('triage', {}).get('category', 'auto')
+        pid = pending_id
+        clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', draft).strip()
+
+        text = (f"✅ [{pid}] DRAFT - {cat}\n"
+                f"Von: {sender}\n"
+                f"Betreff: {subject}\n\n"
+                f"Email:\n{content}\n\n"
+                f"Entwurf:\n{clean}\n\n"
+                f"{pid} ok (senden) | {pid} ändern: [anweisung] | {pid} ignore")
+
+        html = (f"<b>✅ [{pid}] DRAFT — {cat}</b><br/>"
+                f"<b>Von:</b> {sender}<br/>"
+                f"<b>Betreff:</b> {subject}<br/><br/>"
+                f"<b>Email:</b><br/><pre>{content}</pre><br/>"
+                f"<b>Entwurf:</b><br/><pre>{clean}</pre><br/>"
+                f"<code>{pid} ok</code> (senden) | <code>{pid} ändern: [anweisung]</code> | <code>{pid} ignore</code>")
+
+        if self._matrix_send_message(text, html):
+            print(f"  Matrix draft notification sent [{pid}]")
+        else:
+            print(f"  Failed to send Matrix draft notification")
 
     def _matrix_loop(self):
         """Background thread: long-poll Matrix for messages and respond instantly."""
@@ -863,25 +932,19 @@ Grund: {reason}
         if not self.config.get('matrix_enabled', False):
             return
 
-        room_id = self.config.get('matrix_room_id', '')
-
-        # Long-poll: server holds connection until new events or 30s timeout
         result = self._matrix_sync(timeout=30000)
         if not result:
             return
 
-        # Save sync token
         next_batch = result.get('next_batch')
         if next_batch:
             self._matrix_since = next_batch
             self._save_matrix_token()
 
-        # Process messages from the room
+        room_id = self.config.get('matrix_room_id', '')
         rooms = result.get('rooms', {}).get('join', {})
-        room_data = rooms.get(room_id, {})
-        events = room_data.get('timeline', {}).get('events', [])
+        events = rooms.get(room_id, {}).get('timeline', {}).get('events', [])
 
-        # Get the bot's own user ID to ignore its own messages
         bot_user_id = None
         whoami = self._matrix_request('GET', '/account/whoami')
         if whoami:
@@ -893,241 +956,190 @@ Grund: {reason}
             if event.get('sender') == bot_user_id:
                 continue
 
-            body = event.get('content', {}).get('body', '').strip().lower()
+            original_body = event.get('content', {}).get('body', '').strip()
+            body = original_body.lower()
             if not body:
                 continue
 
-            # Help command - no pending decision needed
             if body == '!help':
-                pending_count = 0
-                try:
-                    cat_dir = os.path.join('memory', 'categories')
-                    with open(os.path.join(cat_dir, 'pending_decisions.json'), 'r') as f:
-                        pending_count = len([d for d in json.load(f) if not d.get('resolved', False)])
-                except:
-                    pass
-
-                help_html = f"""<h4>📧 Email-Assistent</h4>
-<b>Model:</b> <code>{self.config['claude_model_name']}</code><br/>
-<b>Offene Entscheidungen:</b> {pending_count}<br/>
-<br/>
-<table>
-<tr><td><code>draft</code></td><td>Draft generieren lassen</td></tr>
-<tr><td><code>call</code></td><td>Beratungsangebot (135 CHF/h)</td></tr>
-<tr><td><code>zeit [wann]</code></td><td>Terminvorschlag senden</td></tr>
-<tr><td><code>antwort [text]</code></td><td>Draft mit deinen Anweisungen</td></tr>
-<tr><td><code>spam</code></td><td>Als Spam markieren + lernen</td></tr>
-<tr><td><code>ignore</code></td><td>Nichts tun</td></tr>
-<tr><td><code>!status</code></td><td>Offene Emails anzeigen</td></tr>
-<tr><td><code>!help</code></td><td>Diese Hilfe</td></tr>
-</table>
-<br/><i>Nummer voranstellen fuer gezieltes Targeting: <code>1 spam</code>, <code>2 draft</code></i>"""
-                self._matrix_send_html(help_html)
+                self._matrix_send_help()
                 continue
 
-            # Status command
             if body == '!status':
-                try:
-                    cat_dir = os.path.join('memory', 'categories')
-                    with open(os.path.join(cat_dir, 'pending_decisions.json'), 'r') as f:
-                        decisions_list = json.load(f)
-                    pending_list = [d for d in decisions_list if not d.get('resolved', False)]
-                    if not pending_list:
-                        self._matrix_send_html("<i>Keine offenen Entscheidungen.</i>")
-                    else:
-                        status_html = f"<b>{len(pending_list)} offene Email(s):</b><br/><br/>"
-                        for i, d in enumerate(pending_list, 1):
-                            cat = d.get('triage_category', '?')
-                            reason = d.get('triage_reason', '')
-                            status_html += f"<b>{i}.</b> {d['sender']}<br/>"
-                            status_html += f"&nbsp;&nbsp;&nbsp;📋 {d['subject']}<br/>"
-                            status_html += f"&nbsp;&nbsp;&nbsp;<code>[{cat}]</code> <i>{reason}</i><br/><br/>"
-                        self._matrix_send_html(status_html)
-                except:
-                    self._matrix_send_html("<i>Keine offenen Entscheidungen.</i>")
+                self._matrix_send_status()
                 continue
 
-            # Load pending decisions
-            categories_dir = os.path.join('memory', 'categories')
-            filepath = os.path.join(categories_dir, 'pending_decisions.json')
-            try:
-                with open(filepath, 'r') as f:
-                    decisions = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
+            # Parse: "<6-char-id> <command> [args]"
+            parts = original_body.split(' ', 2)
+            if len(parts) < 2:
                 continue
 
-            # Find unresolved decisions
-            pending = [(i, d) for i, d in enumerate(decisions) if not d.get('resolved', False)]
-            if not pending:
-                self._matrix_send_html("<i>Keine offenen Entscheidungen.</i>")
+            pid = parts[0].lower()
+            command = parts[1].lower()
+            args = parts[2] if len(parts) > 2 else ''
+
+            pending = self._load_pending()
+            if pid not in pending:
+                self._matrix_send_message(f"❌ ID '{pid}' nicht gefunden. !status für aktuelle Liste.")
                 continue
 
-            # Parse optional number prefix: "2 draft", "3 spam", or just "draft" (= last)
-            original_body = event.get('content', {}).get('body', '').strip()
-            target_idx = None
-            command = body
-            parts = body.split(' ', 1)
-            if len(parts) >= 2 and parts[0].isdigit():
-                target_idx = int(parts[0])
-                command = parts[1].strip()
-                # For 'antwort' and 'zeit', preserve original case for the text part
-                original_parts = original_body.split(' ', 2)
-                if len(original_parts) >= 3:
-                    original_body = original_parts[2]  # text after "N command"
-                elif len(original_parts) >= 2:
-                    original_body = original_parts[1]
+            item = pending[pid]
+            if item.get('resolved'):
+                self._matrix_send_message(f"⚠️ [{pid}] bereits erledigt.")
+                continue
 
-            # Select target decision
-            if target_idx is not None and 1 <= target_idx <= len(pending):
-                _, target = pending[target_idx - 1]
-            else:
-                _, target = pending[-1]  # default: most recent
-
-            if command == 'draft':
-                self._handle_matrix_draft(target, decisions, filepath)
+            if command == 'ok':
+                self._mx_send(pid, item, pending)
+            elif command == 'draft':
+                self._mx_generate_draft(pid, item, pending, 'quick_answer')
             elif command == 'call':
-                self._handle_matrix_call(target, decisions, filepath)
-            elif command.startswith('zeit '):
-                time_str = original_body[5:] if not parts[0].isdigit() else original_body
-                self._handle_matrix_appointment(target, time_str, decisions, filepath)
-            elif command == 'ignore':
-                target['resolved'] = True
-                with open(filepath, 'w') as f:
-                    json.dump(decisions, f, indent=2, ensure_ascii=False)
-                self._matrix_send_html(f"🚫 <b>Ignoriert:</b> {target['sender']}<br/><i>{target['subject']}</i>")
+                self._mx_generate_draft(pid, item, pending, 'paid_consultation')
+            elif command == 'zeit':
+                self._mx_propose_appointment(pid, item, args, pending)
+            elif command in ('ändern', 'antwort'):
+                self._mx_regenerate(pid, item, args, pending)
             elif command == 'spam':
-                spam_data = {
-                    'sender': target['sender'],
-                    'subject': target['subject'],
-                    'content': target.get('content_preview', ''),
-                    'message_id': target.get('message_id', '')
-                }
-                self.mark_as_spam(spam_data)
-                target['resolved'] = True
-                with open(filepath, 'w') as f:
-                    json.dump(decisions, f, indent=2, ensure_ascii=False)
-                self._matrix_send_html(f"🗑️ <b>Spam gelernt:</b> {target['sender']}<br/><i>Absender und Keywords werden ab jetzt gefiltert.</i>")
-            elif command.startswith('antwort '):
-                instructions = original_body[8:] if not parts[0].isdigit() else original_body
-                self._handle_matrix_custom(target, instructions, decisions, filepath)
+                self.mark_as_spam({'sender': item['sender'], 'subject': item['subject'],
+                                   'content': item.get('content', ''), 'message_id': item.get('message_id', '')})
+                item['resolved'] = True
+                self._save_pending(pending)
+                self._matrix_send_html(f"🗑️ <b>Spam [{pid}]:</b> {item['sender']}<br/><i>Wird ab jetzt gefiltert.</i>")
+            elif command == 'ignore':
+                item['resolved'] = True
+                self._save_pending(pending)
+                self._matrix_send_html(f"🚫 <b>Ignoriert [{pid}]:</b> {item['sender']}")
+            else:
+                self._matrix_send_message(f"❓ Unbekannt: '{command}'. !help für Befehle.")
 
-    def _handle_matrix_draft(self, decision: Dict, decisions: list, filepath: str):
-        """Generate and save a draft for a pending decision."""
-        email_data = {
-            'sender': decision['sender'],
-            'subject': decision['subject'],
-            'content': decision.get('content_preview', ''),
-            'message_id': decision.get('message_id', ''),
-            'triage': {'category': 'quick_answer'}
-        }
-        response = self.generate_response(email_data)
-        if response and not response.startswith("Error"):
-            self.save_draft(email_data, response)
-            self.update_history(email_data, response)
-            decision['resolved'] = True
-            with open(filepath, 'w') as f:
-                json.dump(decisions, f, indent=2, ensure_ascii=False)
-            self._matrix_send_html(f"✅ <b>Draft erstellt</b><br/>An: {decision['sender']}<br/>📋 <i>{decision['subject']}</i>")
-        else:
-            self._matrix_send_html(f"❌ <b>Fehler:</b> {response}")
+    def _matrix_send_help(self):
+        pending = self._load_pending()
+        open_count = sum(1 for d in pending.values() if not d.get('resolved'))
+        html = (f"<h4>📧 Email-Assistent</h4>"
+                f"<b>Model:</b> <code>{self.config['claude_model_name']}</code><br/>"
+                f"<b>Offene Items:</b> {open_count}<br/><br/>"
+                f"<b>[id]</b> = 6-stellige ID aus der Notification<br/><br/>"
+                f"<code>[id] ok</code> — Draft senden<br/>"
+                f"<code>[id] draft</code> — Draft generieren<br/>"
+                f"<code>[id] call</code> — Beratungsangebot (135 CHF/h)<br/>"
+                f"<code>[id] zeit [wann]</code> — Terminvorschlag erstellen<br/>"
+                f"<code>[id] ändern [text]</code> — Draft anpassen<br/>"
+                f"<code>[id] antwort [text]</code> — Draft mit Anweisung<br/>"
+                f"<code>[id] spam</code> — Als Spam markieren<br/>"
+                f"<code>[id] ignore</code> — Ignorieren<br/><br/>"
+                f"<code>!status</code> — Alle offenen Items<br/>"
+                f"<code>!help</code> — Diese Hilfe")
+        self._matrix_send_html(html)
 
-    def _handle_matrix_call(self, decision: Dict, decisions: list, filepath: str):
-        """Generate a paid consultation response for a pending decision."""
-        email_data = {
-            'sender': decision['sender'],
-            'subject': decision['subject'],
-            'content': decision.get('content_preview', ''),
-            'message_id': decision.get('message_id', ''),
-            'triage': {'category': 'paid_consultation'}
-        }
-        response = self.generate_response(email_data)
-        if response and not response.startswith("Error"):
-            self.save_draft(email_data, response)
-            self.update_history(email_data, response)
-            decision['resolved'] = True
-            with open(filepath, 'w') as f:
-                json.dump(decisions, f, indent=2, ensure_ascii=False)
-            self._matrix_send_html(f"✅ <b>Beratungsangebot-Draft erstellt</b><br/>An: {decision['sender']}<br/>💰 <i>135 CHF/h</i>")
-        else:
-            self._matrix_send_html(f"❌ <b>Fehler:</b> {response}")
-
-    def _handle_matrix_send(self, draft_idx: Optional[int]):
-        """Send a pending auto-generated draft via SMTP."""
-        drafts = self.draft_tracking.get('pending_drafts', [])
-        if not drafts:
-            self._matrix_send_message("Keine ausstehenden Drafts.")
+    def _matrix_send_status(self):
+        pending = self._load_pending()
+        open_items = [(pid, d) for pid, d in pending.items() if not d.get('resolved')]
+        if not open_items:
+            self._matrix_send_html("<i>Keine offenen Items.</i>")
             return
+        html = f"<b>{len(open_items)} offene Item(s):</b><br/><br/>"
+        for pid, d in open_items:
+            cat = d.get('triage_category', '?')
+            has_draft = "✅ Draft bereit" if d.get('draft') else "⏳ Kein Draft"
+            html += (f"<b>[{pid}]</b> {d['sender']}<br/>"
+                     f"&nbsp;&nbsp;📋 {d['subject']}<br/>"
+                     f"&nbsp;&nbsp;<code>{cat}</code> | {has_draft}<br/><br/>")
+        self._matrix_send_html(html)
 
-        if draft_idx and 1 <= draft_idx <= len(drafts):
-            idx = draft_idx - 1
-        else:
-            self._matrix_send_message(f"❌ Draft [{draft_idx}] nicht gefunden. Aktuell {len(drafts)} Draft(s) in der Liste.")
+    def _mx_generate_draft(self, pid: str, item: Dict, pending: Dict, category: str):
+        """Generate a draft for a pending item and show it in Matrix."""
+        email_data = {
+            'sender': item['sender'],
+            'subject': item['subject'],
+            'content': item.get('content', ''),
+            'message_id': item.get('message_id', ''),
+            'triage': {'category': category}
+        }
+        response = self.generate_response(email_data)
+        if not response or response.startswith("Error"):
+            self._matrix_send_message(f"❌ [{pid}] Fehler: {response}")
             return
-        idx = draft_idx - 1
-        draft = drafts[idx]
+        clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
+        item['draft'] = clean
+        item['draft_raw'] = response
+        self._save_pending(pending)
+        cat_label = "💰 Beratungsangebot (135 CHF/h)" if category == 'paid_consultation' else "✅ Draft"
+        html = (f"<b>{cat_label} [{pid}]</b><br/>"
+                f"<b>An:</b> {item['sender']}<br/><br/>"
+                f"<b>Entwurf:</b><br/><pre>{clean}</pre><br/>"
+                f"<code>{pid} ok</code> (senden) | <code>{pid} ändern [anweisung]</code>")
+        self._matrix_send_html(html)
 
-        to = draft['recipient']
-        subject = draft['subject'] if draft['subject'].startswith('Re:') else f"Re: {draft['subject']}"
-        body = draft['draft_response']
-        in_reply_to = draft.get('original_message_id', '')
-
-        has_calendar = 'CALENDAR_MARKER' in body
-        if self.send_via_smtp(to, subject, body, in_reply_to):
-            drafts.pop(idx)
-            self.draft_tracking['pending_drafts'] = drafts
-            self.save_draft_tracking()
-            cal_info = " 📅 Kalender-Eintrag erstellt." if has_calendar else ""
-            self._matrix_send_html(
-                f"📤 <b>Gesendet an {to}</b><br/>"
-                f"<i>{subject}</i>{cal_info}"
-            )
-        else:
-            self._matrix_send_message(f"❌ Senden fehlgeschlagen. Bitte manuell senden.")
-
-    def _handle_matrix_appointment(self, decision: Dict, time_str: str, decisions: list, filepath: str):
-        """Generate an appointment proposal response."""
+    def _mx_propose_appointment(self, pid: str, item: Dict, time_str: str, pending: Dict):
+        """Generate appointment proposal draft."""
         email_data = {
-            'sender': decision['sender'],
-            'subject': decision['subject'],
-            'content': decision.get('content_preview', ''),
-            'message_id': decision.get('message_id', ''),
+            'sender': item['sender'],
+            'subject': item['subject'],
+            'content': item.get('content', '') + f"\n\n[SYSTEM: Schlage folgenden Termin vor: {time_str}]",
+            'message_id': item.get('message_id', ''),
             'triage': {'category': 'quick_answer'}
         }
-        # Add appointment time to the context so Claude includes it in the response
-        email_data['content'] += f"\n\n[SYSTEM: Der Kunde hat nach einem Termin gefragt. Mario hat Zeit am: {time_str}. Schlage diesen Termin vor.]"
-
         response = self.generate_response(email_data)
-        if response and not response.startswith("Error"):
-            self.save_draft(email_data, response)
-            self.update_history(email_data, response)
-            decision['resolved'] = True
-            with open(filepath, 'w') as f:
-                json.dump(decisions, f, indent=2, ensure_ascii=False)
-            self._matrix_send_html(f"✅ <b>Terminvorschlag-Draft erstellt</b><br/>An: {decision['sender']}<br/>📅 <i>{time_str}</i>")
-        else:
-            self._matrix_send_html(f"❌ <b>Fehler:</b> {response}")
+        if not response or response.startswith("Error"):
+            self._matrix_send_message(f"❌ [{pid}] Fehler: {response}")
+            return
+        clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
+        item['draft'] = clean
+        item['draft_raw'] = response
+        item['appointment_stage'] = 'proposed'
+        item['appointment_time'] = time_str
+        self._save_pending(pending)
+        html = (f"<b>📅 Terminvorschlag [{pid}]</b><br/>"
+                f"<b>An:</b> {item['sender']}<br/>"
+                f"<b>Zeit:</b> {time_str}<br/><br/>"
+                f"<b>Entwurf:</b><br/><pre>{clean}</pre><br/>"
+                f"<code>{pid} ok</code> (senden + Kalender) | <code>{pid} ändern [anweisung]</code>")
+        self._matrix_send_html(html)
 
-    def _handle_matrix_custom(self, decision: Dict, instructions: str, decisions: list, filepath: str):
-        """Generate a draft based on custom instructions from Matrix."""
+    def _mx_regenerate(self, pid: str, item: Dict, instructions: str, pending: Dict):
+        """Regenerate draft with custom instructions."""
         email_data = {
-            'sender': decision['sender'],
-            'subject': decision['subject'],
-            'content': decision.get('content_preview', ''),
-            'message_id': decision.get('message_id', ''),
+            'sender': item['sender'],
+            'subject': item['subject'],
+            'content': item.get('content', '') + f"\n\n[SYSTEM: {instructions}]",
+            'message_id': item.get('message_id', ''),
             'triage': {'category': 'quick_answer'}
         }
-        email_data['content'] += f"\n\n[SYSTEM: Mario moechte folgendes antworten. Formuliere seine Anweisungen als professionelle, freundliche Email in der Sprache des Kunden: {instructions}]"
-
         response = self.generate_response(email_data)
-        if response and not response.startswith("Error"):
-            self.save_draft(email_data, response)
-            self.update_history(email_data, response)
-            decision['resolved'] = True
-            with open(filepath, 'w') as f:
-                json.dump(decisions, f, indent=2, ensure_ascii=False)
-            self._matrix_send_html(f"✅ <b>Draft erstellt</b> (nach deinen Anweisungen)<br/>An: {decision['sender']}<br/>📋 <i>{decision['subject']}</i>")
+        if not response or response.startswith("Error"):
+            self._matrix_send_message(f"❌ [{pid}] Fehler: {response}")
+            return
+        clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
+        item['draft'] = clean
+        item['draft_raw'] = response
+        self._save_pending(pending)
+        html = (f"<b>✏️ Draft aktualisiert [{pid}]</b><br/>"
+                f"<b>An:</b> {item['sender']}<br/><br/>"
+                f"<b>Entwurf:</b><br/><pre>{clean}</pre><br/>"
+                f"<code>{pid} ok</code> (senden) | <code>{pid} ändern [anweisung]</code>")
+        self._matrix_send_html(html)
+
+    def _mx_send(self, pid: str, item: Dict, pending: Dict):
+        """Send the draft for a pending item via SMTP."""
+        if not item.get('draft'):
+            self._matrix_send_message(f"❌ [{pid}] Kein Draft. Erst '{pid} draft' aufrufen.")
+            return
+        to = item['sender']
+        subject = item['subject'] if item['subject'].startswith('Re:') else f"Re: {item['subject']}"
+        body_raw = item.get('draft_raw', item['draft'])
+        in_reply_to = item.get('message_id', '')
+
+        if self.send_via_smtp(to, subject, body_raw, in_reply_to):
+            email_data = {'sender': item['sender'], 'subject': item['subject'],
+                          'content': item.get('content', ''), 'message_id': item.get('message_id', '')}
+            self.update_history(email_data, item['draft'])
+            item['resolved'] = True
+            self._save_pending(pending)
+            cal_note = ""
+            if item.get('appointment_stage') == 'proposed' and item.get('appointment_time'):
+                cal_note = f"<br/>📅 Kalender-Eintrag für: {item['appointment_time']}"
+            self._matrix_send_html(f"📤 <b>Gesendet [{pid}]</b><br/>An: {to}{cal_note}")
         else:
-            self._matrix_send_html(f"❌ <b>Fehler:</b> {response}")
+            self._matrix_send_message(f"❌ [{pid}] SMTP fehlgeschlagen. Manuell senden.")
 
     def _test_matrix_connection(self):
         """Test Matrix connection on startup."""
@@ -1423,6 +1435,23 @@ Inhalt: {email_data['content']}"""
                 smtp.send_message(msg)
 
             print(f"✓ Email sent to {to}: {subject}")
+
+            # Save copy to IMAP Sent folder
+            try:
+                sent_raw = msg.as_bytes()
+                sent_time = imaplib.Time2Internaldate(time.time())
+                for sent_folder in ('INBOX.Sent', 'Sent', 'Sent Messages', 'INBOX.Sent Messages'):
+                    try:
+                        result = self.imap.append(sent_folder, '\\Seen', sent_time, sent_raw)
+                        if result[0] == 'OK':
+                            print(f"  Saved to IMAP Sent folder: {sent_folder}")
+                            break
+                    except Exception:
+                        continue
+                else:
+                    print("  Could not save to IMAP Sent folder (tried all variants)")
+            except Exception as e:
+                print(f"  Error saving to Sent folder: {e}")
 
             # Create calendar event if marker was found
             if appointment and self.config.get('enable_calendar', True):
@@ -2257,8 +2286,8 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
 
                             if category in ('needs_human', 'appointment_request'):
                                 print(f"  Triage: {category}, saving for human review")
-                                self._save_pending_decision(email_data, triage)
-                                self._matrix_notify_pending(email_data, triage)
+                                pid = self._save_pending_decision(email_data, triage)
+                                self._matrix_notify_pending(email_data, triage, pid)
                                 if message_id:
                                     self.draft_tracking['processed_incoming_ids'].append(message_id)
                                     self.save_draft_tracking()
@@ -2281,7 +2310,8 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                         # quick_answer or paid_consultation (or triage disabled) -> generate draft
                         response = self.generate_response(email_data)
                         if response and not response.startswith("Error generating"):
-                            self.save_draft(email_data, response)
+                            pid = self._save_pending_draft(email_data, response)
+                            self.save_draft(email_data, response)  # backup in IMAP Drafts
                             self.update_history(email_data, response)
 
                             # Track that we've processed this incoming email
@@ -2290,25 +2320,11 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                 self.save_draft_tracking()
 
                             category_info = f" [{email_data.get('triage', {}).get('category', 'unclassified')}]" if triage_enabled else ""
-                            print(f"Draft saved for email from {email_data['sender']}{category_info}")
+                            print(f"Draft saved for email from {email_data['sender']}{category_info} [{pid}]")
 
-                            # Notify via Matrix
+                            # Notify via Matrix with confirmation flow
                             if self.config.get('matrix_enabled'):
-                                cat = email_data.get('triage', {}).get('category', 'auto')
-                                # Use actual current index (1-based) in pending_drafts
-                                num = len(self.draft_tracking['pending_drafts'])
-                                sender_name = email_data.get('sender_name') or email_data['sender']
-                                subject = email_data.get('subject', '')
-                                # Strip CALENDAR_MARKER from preview
-                                clean_preview = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
-                                preview = clean_preview[:300].replace('\n', ' ')
-                                text = (f"✅ [{num}] DRAFT ERSTELLT\n"
-                                        f"Von: {sender_name}\n"
-                                        f"Betreff: {subject}\n"
-                                        f"Kategorie: {cat}\n\n"
-                                        f"Entwurf:\n{preview}{'...' if len(clean_preview) > 300 else ''}\n\n"
-                                        f"Draft im Mailclient prüfen und manuell senden.")
-                                self._matrix_send_message(text)
+                                self._matrix_notify_draft(email_data, response, pid)
                         else:
                             print(f"Skipping draft save due to error for {email_data['sender']}")
                     except Exception as e:
