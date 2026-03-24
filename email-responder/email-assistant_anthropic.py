@@ -1552,13 +1552,21 @@ Inhalt: {email_data['content']}"""
                             print(f"    Already learned from this sent email, skipping")
                             continue
 
-                        # Now fetch full body only if needed
-                        _, msg_data = self.imap.fetch(num, '(RFC822)')
-                        if not msg_data or not msg_data[0] or len(msg_data[0]) < 2:
+                        # Fetch headers + text body only (no attachments)
+                        _, msg_data = self.imap.fetch(num, '(BODY.PEEK[HEADER] BODY.PEEK[TEXT])')
+                        if not msg_data or not msg_data[0]:
                             print(f"    ERROR: Failed to fetch email #{num.decode()}")
                             continue
-                        email_body = msg_data[0][1]
-                        email_message = email.message_from_bytes(email_body)
+                        # Reconstruct a minimal email from header + text parts
+                        header_bytes = b''
+                        text_bytes = b''
+                        for part in msg_data:
+                            if isinstance(part, tuple):
+                                if b'HEADER' in part[0]:
+                                    header_bytes = part[1]
+                                elif b'TEXT' in part[0]:
+                                    text_bytes = part[1]
+                        email_message = email.message_from_bytes(header_bytes + b'\r\n' + text_bytes)
 
                         content = self._extract_text_content(email_message)
 
