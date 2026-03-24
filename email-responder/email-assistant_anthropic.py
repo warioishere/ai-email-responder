@@ -1,4 +1,5 @@
 import imaplib
+import smtplib
 import email
 from email.header import decode_header
 import os
@@ -982,7 +983,9 @@ Grund: {reason}
             else:
                 _, target = pending[-1]  # default: most recent
 
-            if command == 'draft':
+            if command == 'send':
+                self._handle_matrix_send(target_idx)
+            elif command == 'draft':
                 self._handle_matrix_draft(target, decisions, filepath)
             elif command == 'call':
                 self._handle_matrix_call(target, decisions, filepath)
@@ -1049,6 +1052,32 @@ Grund: {reason}
             self._matrix_send_html(f"✅ <b>Beratungsangebot-Draft erstellt</b><br/>An: {decision['sender']}<br/>💰 <i>135 CHF/h</i>")
         else:
             self._matrix_send_html(f"❌ <b>Fehler:</b> {response}")
+
+    def _handle_matrix_send(self, draft_idx: Optional[int]):
+        """Send a pending auto-generated draft via SMTP."""
+        drafts = self.draft_tracking.get('pending_drafts', [])
+        if not drafts:
+            self._matrix_send_message("Keine ausstehenden Drafts.")
+            return
+
+        idx = (draft_idx - 1) if draft_idx and 1 <= draft_idx <= len(drafts) else len(drafts) - 1
+        draft = drafts[idx]
+
+        to = draft['recipient']
+        subject = draft['subject'] if draft['subject'].startswith('Re:') else f"Re: {draft['subject']}"
+        body = draft['draft_response']
+        in_reply_to = draft.get('original_message_id', '')
+
+        if self.send_via_smtp(to, subject, body, in_reply_to):
+            drafts.pop(idx)
+            self.draft_tracking['pending_drafts'] = drafts
+            self.save_draft_tracking()
+            self._matrix_send_html(
+                f"📤 <b>Gesendet an {to}</b><br/>"
+                f"<i>{subject}</i>"
+            )
+        else:
+            self._matrix_send_message(f"❌ Senden fehlgeschlagen. Bitte manuell senden.")
 
     def _handle_matrix_appointment(self, decision: Dict, time_str: str, decisions: list, filepath: str):
         """Generate an appointment proposal response."""
@@ -1352,6 +1381,48 @@ Inhalt: {email_data['content']}"""
             'original_message_id': email_data['message_id']
         })
         self.save_draft_tracking()
+
+    def send_via_smtp(self, to: str, subject: str, body: str, in_reply_to: str = '') -> bool:
+        """Send an email via SMTP and remove the corresponding draft from IMAP."""
+        try:
+            msg = EmailMessage()
+            msg['From'] = self.config['email']
+            msg['To'] = to
+            msg['Subject'] = subject
+            if in_reply_to:
+                msg['In-Reply-To'] = in_reply_to
+                msg['References'] = in_reply_to
+            msg.set_content(self.remove_markdown(body))
+
+            smtp_server = self.config.get('smtp_server', self.config['imap_server'])
+            smtp_port = self.config.get('smtp_port', 587)
+
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as smtp:
+                smtp.starttls()
+                smtp.login(self.config['email'], self.config['password'])
+                smtp.send_message(msg)
+
+            print(f"✓ Email sent to {to}: {subject}")
+
+            # Remove matching draft from IMAP Drafts folder
+            try:
+                self.imap.select('Drafts')
+                if in_reply_to:
+                    _, nums = self.imap.search(None, f'HEADER In-Reply-To "{in_reply_to}"')
+                else:
+                    _, nums = self.imap.search(None, f'HEADER Subject "{subject}" TO "{to}"')
+                if nums[0]:
+                    for num in nums[0].split():
+                        self.imap.store(num, '+FLAGS', '\\Deleted')
+                    self.imap.expunge()
+                    print(f"  Draft removed from IMAP Drafts")
+            except Exception as e:
+                print(f"  Could not remove draft from IMAP: {e}")
+
+            return True
+        except Exception as e:
+            print(f"✗ SMTP send failed: {e}")
+            return False
 
     def find_email_by_message_id(self, message_id: str) -> Optional[Dict]:
         """Find an email by its Message-ID in the INBOX."""
@@ -2197,7 +2268,7 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                         f"Betreff: {subject}\n"
                                         f"Kategorie: {cat}\n\n"
                                         f"Entwurf:\n{preview}{'...' if len(response) > 300 else ''}\n\n"
-                                        f"send | ignore")
+                                        f"{num} send | {num} ignore")
                                 self._matrix_send_message(text)
                         else:
                             print(f"Skipping draft save due to error for {email_data['sender']}")
