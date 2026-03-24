@@ -507,7 +507,7 @@ class EmailAssistant:
 
         emails = []
         for num in message_numbers[0].split():
-            _, msg_data = self.imap.fetch(num, '(RFC822)')
+            _, msg_data = self.imap.fetch(num, '(BODY.PEEK[])')
             email_body = msg_data[0][1]
             email_message = email.message_from_bytes(email_body)
 
