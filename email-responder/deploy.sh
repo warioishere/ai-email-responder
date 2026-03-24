@@ -78,7 +78,8 @@ Wants=network-online.target
 Type=simple
 User=$USER
 WorkingDirectory=$REMOTE_DIR
-ExecStart=$REMOTE_DIR/.venv/bin/python3 email-assistant_anthropic.py
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$REMOTE_DIR/.venv/bin/python3 -u email-assistant_anthropic.py
 Restart=always
 RestartSec=10
 
