@@ -2071,7 +2071,8 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
             client = caldav.DAVClient(
                 url=self.config['caldav_url'],
                 username=self.config['caldav_username'],
-                password=self.config['caldav_password']
+                password=self.config['caldav_password'],
+                timeout=10
             )
 
             principal = client.principal()
@@ -2082,7 +2083,7 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
             calendar_name = self.config.get('caldav_calendar', 'Persönlich')
 
             for cal in calendars:
-                if calendar_name in cal.name:
+                if calendar_name in cal.get_display_name():
                     target_calendar = cal
                     break
 
@@ -2144,7 +2145,7 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
             json.dump(log, f, indent=2)
 
     def test_caldav_connection(self):
-        """Test CalDAV connection on startup."""
+        """Test CalDAV connection on startup (with 10s timeout)."""
         if not self.config.get('enable_calendar', False):
             print("📅 Calendar integration: DISABLED")
             return False
@@ -2156,7 +2157,8 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
             client = caldav.DAVClient(
                 url=self.config['caldav_url'],
                 username=self.config['caldav_username'],
-                password=self.config['caldav_password']
+                password=self.config['caldav_password'],
+                timeout=10
             )
 
             principal = client.principal()
@@ -2166,24 +2168,20 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
             target_calendar = None
 
             for cal in calendars:
-                if calendar_name in cal.name:
+                if calendar_name in cal.get_display_name():
                     target_calendar = cal
                     break
 
             if target_calendar:
                 print(f"✅ Calendar connection SUCCESS: '{calendar_name}' calendar found")
-                print(f"   URL: {self.config['caldav_url']}")
-                print(f"   User: {self.config['caldav_username']}")
                 return True
             else:
                 print(f"⚠️  Calendar connection OK, but '{calendar_name}' calendar not found")
-                print(f"   Available calendars: {[cal.name for cal in calendars]}")
+                print(f"   Available calendars: {[cal.get_display_name() for cal in calendars]}")
                 return False
 
         except Exception as e:
             print(f"❌ Calendar connection FAILED: {str(e)}")
-            print(f"   URL: {self.config['caldav_url']}")
-            print(f"   User: {self.config['caldav_username']}")
             print(f"   Calendar integration will be disabled")
             return False
 
