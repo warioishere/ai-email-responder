@@ -27,3 +27,5 @@ matrix_enabled: true
 matrix_homeserver: "https://matrix.example.com"
 matrix_access_token: "your-access-token"
 matrix_room_id: "!roomid:matrix.example.com"
+# Article linking - reference blog articles in email responses
+article_linking_enabled: false

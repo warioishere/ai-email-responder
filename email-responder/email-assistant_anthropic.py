@@ -814,8 +814,9 @@ Has existing conversation: {has_history}"""
 
     def _matrix_notify_pending(self, email_data: Dict, triage: Dict, pending_id: str = None):
         """Send Matrix notification for email needing human review."""
-        category = triage['category']
-        emoji = {"needs_human": "❓", "appointment_request": "📅"}.get(category, "📧")
+        category = triage.get('category', 'unclassified')
+        emoji = {"needs_human": "❓", "appointment_request": "📅", "quick_answer": "📧",
+                 "paid_consultation": "💰", "order_notification": "📦"}.get(category, "📧")
         sender = email_data['sender']
         subject = email_data['subject']
         reason = triage.get('reason', '')
@@ -2284,49 +2285,23 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                     self.save_draft_tracking()
                                 continue
 
-                            if category in ('needs_human', 'appointment_request'):
-                                print(f"  Triage: {category}, saving for human review")
-                                pid = self._save_pending_decision(email_data, triage)
-                                self._matrix_notify_pending(email_data, triage, pid)
-                                if message_id:
-                                    self.draft_tracking['processed_incoming_ids'].append(message_id)
-                                    self.save_draft_tracking()
-                                continue
-
                             if category == 'order_notification':
-                                # Order/sale notifications: don't auto-reply unless there's an existing conversation
                                 has_conv = email_data['sender'] in self.conversation_history and \
                                            len(self.conversation_history[email_data['sender']]) > 0
-                                if has_conv:
-                                    print(f"  Triage: order_notification but existing conversation found, generating draft")
-                                    # Fall through to generate response
-                                else:
-                                    print(f"  Triage: order_notification, no existing conversation, skipping")
+                                if not has_conv:
+                                    print(f"  Triage: order_notification, no conversation, skipping")
                                     if message_id:
                                         self.draft_tracking['processed_incoming_ids'].append(message_id)
                                         self.save_draft_tracking()
                                     continue
 
-                        # quick_answer or paid_consultation (or triage disabled) -> generate draft
-                        response = self.generate_response(email_data)
-                        if response and not response.startswith("Error generating"):
-                            pid = self._save_pending_draft(email_data, response)
-                            self.save_draft(email_data, response)  # backup in IMAP Drafts
-                            self.update_history(email_data, response)
-
-                            # Track that we've processed this incoming email
-                            if message_id:
-                                self.draft_tracking['processed_incoming_ids'].append(message_id)
-                                self.save_draft_tracking()
-
-                            category_info = f" [{email_data.get('triage', {}).get('category', 'unclassified')}]" if triage_enabled else ""
-                            print(f"Draft saved for email from {email_data['sender']}{category_info} [{pid}]")
-
-                            # Notify via Matrix with confirmation flow
-                            if self.config.get('matrix_enabled'):
-                                self._matrix_notify_draft(email_data, response, pid)
-                        else:
-                            print(f"Skipping draft save due to error for {email_data['sender']}")
+                        # All real emails -> pending for human decision via Matrix
+                        pid = self._save_pending_decision(email_data, triage if triage_enabled else {'category': 'unclassified', 'confidence': 0, 'reason': ''})
+                        self._matrix_notify_pending(email_data, triage if triage_enabled else {'category': 'unclassified', 'confidence': 0, 'reason': ''}, pid)
+                        if message_id:
+                            self.draft_tracking['processed_incoming_ids'].append(message_id)
+                            self.save_draft_tracking()
+                        print(f"  Pending [{pid}] for {email_data['sender']}")
                     except Exception as e:
                         print(f"Error processing email from {email_data['sender']}: {str(e)}")
                         import traceback
