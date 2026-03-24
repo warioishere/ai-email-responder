@@ -1060,7 +1060,12 @@ Grund: {reason}
             self._matrix_send_message("Keine ausstehenden Drafts.")
             return
 
-        idx = (draft_idx - 1) if draft_idx and 1 <= draft_idx <= len(drafts) else len(drafts) - 1
+        if draft_idx and 1 <= draft_idx <= len(drafts):
+            idx = draft_idx - 1
+        else:
+            self._matrix_send_message(f"❌ Draft [{draft_idx}] nicht gefunden. Aktuell {len(drafts)} Draft(s) in der Liste.")
+            return
+        idx = draft_idx - 1
         draft = drafts[idx]
 
         to = draft['recipient']
@@ -2270,15 +2275,18 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                             # Notify via Matrix
                             if self.config.get('matrix_enabled'):
                                 cat = email_data.get('triage', {}).get('category', 'auto')
+                                # Use actual current index (1-based) in pending_drafts
                                 num = len(self.draft_tracking['pending_drafts'])
                                 sender_name = email_data.get('sender_name') or email_data['sender']
                                 subject = email_data.get('subject', '')
-                                preview = response[:300].replace('\n', ' ')
+                                # Strip CALENDAR_MARKER from preview
+                                clean_preview = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
+                                preview = clean_preview[:300].replace('\n', ' ')
                                 text = (f"✅ [{num}] DRAFT ERSTELLT\n"
                                         f"Von: {sender_name}\n"
                                         f"Betreff: {subject}\n"
                                         f"Kategorie: {cat}\n\n"
-                                        f"Entwurf:\n{preview}{'...' if len(response) > 300 else ''}\n\n"
+                                        f"Entwurf:\n{preview}{'...' if len(clean_preview) > 300 else ''}\n\n"
                                         f"{num} send | {num} ignore")
                                 self._matrix_send_message(text)
                         else:
