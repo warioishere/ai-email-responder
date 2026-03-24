@@ -1359,8 +1359,8 @@ Inhalt: {email_data['content']}"""
         subject = email_data['subject'].replace('\n', ' ').replace('\r', ' ').strip()
         message_id = email_data['message_id'].replace('\n', '').replace('\r', '').strip()
 
-        # Remove markdown formatting from response
-        clean_response = self.remove_markdown(response)
+        # Strip CALENDAR_MARKER from IMAP draft (kept in tracking for N send)
+        clean_response = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', self.remove_markdown(response)).strip()
 
         draft = EmailMessage()
         draft['To'] = email_data['sender']
@@ -1373,7 +1373,7 @@ Inhalt: {email_data['content']}"""
         self.imap.append('Drafts', '', imaplib.Time2Internaldate(time.time()),
                         draft.as_bytes())
 
-        # Track this draft for learning
+        # Track this draft for learning (keep original response with marker for calendar)
         self.draft_tracking['pending_drafts'].append({
             'timestamp': datetime.now().isoformat(),
             'recipient': email_data['sender'],
