@@ -2182,10 +2182,23 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                 self.draft_tracking['processed_incoming_ids'].append(message_id)
                                 self.save_draft_tracking()
 
-                            # Never mark as read - prevents emails from going unnoticed
-
                             category_info = f" [{email_data.get('triage', {}).get('category', 'unclassified')}]" if triage_enabled else ""
                             print(f"Draft saved for email from {email_data['sender']}{category_info}")
+
+                            # Notify via Matrix
+                            if self.config.get('matrix_enabled'):
+                                cat = email_data.get('triage', {}).get('category', 'auto')
+                                num = len(self.draft_tracking['pending_drafts'])
+                                sender_name = email_data.get('sender_name') or email_data['sender']
+                                subject = email_data.get('subject', '')
+                                preview = response[:300].replace('\n', ' ')
+                                text = (f"✅ [{num}] DRAFT ERSTELLT\n"
+                                        f"Von: {sender_name}\n"
+                                        f"Betreff: {subject}\n"
+                                        f"Kategorie: {cat}\n\n"
+                                        f"Entwurf:\n{preview}{'...' if len(response) > 300 else ''}\n\n"
+                                        f"send | ignore")
+                                self._matrix_send_message(text)
                         else:
                             print(f"Skipping draft save due to error for {email_data['sender']}")
                     except Exception as e:
