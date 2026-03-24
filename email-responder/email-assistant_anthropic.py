@@ -625,6 +625,16 @@ Has existing conversation: {has_history}"""
             )
 
             result_text = response.content[0].text.strip()
+            if not result_text:
+                raise ValueError("Empty response from model")
+            # Strip markdown code blocks if model wrapped the JSON
+            if result_text.startswith('```'):
+                result_text = re.sub(r'^```[a-z]*\n?', '', result_text)
+                result_text = re.sub(r'\n?```$', '', result_text).strip()
+            # Extract JSON object if there's surrounding text
+            json_match = re.search(r'\{[^{}]+\}', result_text, re.DOTALL)
+            if json_match:
+                result_text = json_match.group(0)
             result = json.loads(result_text)
 
             valid_categories = ['quick_answer', 'paid_consultation', 'appointment_request',
@@ -638,6 +648,10 @@ Has existing conversation: {has_history}"""
 
         except (json.JSONDecodeError, Exception) as e:
             print(f"Error classifying email: {e}")
+            try:
+                print(f"  Raw response was: {repr(result_text)}")
+            except NameError:
+                pass
             return {'category': 'needs_human', 'confidence': 0.0, 'reason': f'Classification error: {str(e)}'}
 
     def _save_pending_decision(self, email_data: Dict, triage: Dict):
