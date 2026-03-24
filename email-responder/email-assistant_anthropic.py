@@ -2,6 +2,7 @@ import imaplib
 import email
 from email.header import decode_header
 import os
+import socket
 from email.message import EmailMessage
 from anthropic import Anthropic
 from datetime import datetime
@@ -185,6 +186,7 @@ class EmailAssistant:
     def connect_imap(self):
         """Connect to IMAP server."""
         try:
+            socket.setdefaulttimeout(30)
             self.imap = imaplib.IMAP4_SSL(self.config['imap_server'])
             self.imap.login(self.config['email'], self.config['password'])
             print("✓ IMAP connection established")
@@ -201,6 +203,7 @@ class EmailAssistant:
             except:
                 pass  # Connection already dead
 
+            socket.setdefaulttimeout(30)
             self.imap = imaplib.IMAP4_SSL(self.config['imap_server'])
             self.imap.login(self.config['email'], self.config['password'])
             print("✓ IMAP reconnection successful")
@@ -2083,12 +2086,20 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
 
                 # First, learn from spam folder
                 print("Learning from spam folder...")
-                self.learn_from_spam_folder()
+                try:
+                    self.learn_from_spam_folder()
+                except (socket.timeout, imaplib.IMAP4.abort, OSError) as e:
+                    print(f"  IMAP error in spam learning: {e}, reconnecting...")
+                    self.reconnect_imap()
                 print()
 
                 # Learn from sent emails
                 print("Learning from sent emails...")
-                self.learn_from_sent_emails()
+                try:
+                    self.learn_from_sent_emails()
+                except (socket.timeout, imaplib.IMAP4.abort, OSError) as e:
+                    print(f"  IMAP error in sent learning: {e}, reconnecting...")
+                    self.reconnect_imap()
                 print()
 
                 # Then process new emails
