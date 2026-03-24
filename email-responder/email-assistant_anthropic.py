@@ -1376,15 +1376,26 @@ Inhalt: {email_data['content']}"""
         self.imap.append('Drafts', '', imaplib.Time2Internaldate(time.time()),
                         draft.as_bytes())
 
-        # Track this draft for learning (keep original response with marker for calendar)
-        self.draft_tracking['pending_drafts'].append({
+        # Parse calendar data now and store in tracking
+        appointment = self.parse_calendar_marker(response, email_data['sender'], subject)
+
+        entry = {
             'timestamp': datetime.now().isoformat(),
             'recipient': email_data['sender'],
             'subject': email_data['subject'],
             'original_content': email_data['content'],
             'draft_response': response,
             'original_message_id': email_data['message_id']
-        })
+        }
+        if appointment:
+            entry['calendar_appointment'] = {
+                'title': appointment['title'],
+                'start': appointment['start'].isoformat(),
+                'end': appointment['end'].isoformat(),
+                'location': appointment.get('location', ''),
+                'description': appointment.get('description', '')
+            }
+        self.draft_tracking['pending_drafts'].append(entry)
         self.save_draft_tracking()
 
     def send_via_smtp(self, to: str, subject: str, body: str, in_reply_to: str = '') -> bool:
@@ -1798,11 +1809,22 @@ Inhalt: {email_data['content']}"""
                             self.update_history(email_data, content)
                             print(f"    Updated conversation history for {matched_draft['recipient']}")
 
-                            # Check if this email contains an appointment confirmation
-                            appointment = self.parse_calendar_marker(content, matched_draft['recipient'], matched_draft['subject'])
-                            if appointment:
-                                print(f"Found appointment in sent email: {appointment['start'].strftime('%d.%m.%Y %H:%M')}")
-                                self.create_calendar_event(appointment)
+                            # Create calendar event from stored appointment data (marker stripped from IMAP draft)
+                            cal_data = matched_draft.get('calendar_appointment')
+                            if cal_data:
+                                try:
+                                    from datetime import datetime as dt
+                                    appointment = {
+                                        'title': cal_data['title'],
+                                        'start': dt.fromisoformat(cal_data['start']),
+                                        'end': dt.fromisoformat(cal_data['end']),
+                                        'location': cal_data.get('location', ''),
+                                        'description': cal_data.get('description', '')
+                                    }
+                                    print(f"Creating calendar event from draft tracking: {cal_data['title']}")
+                                    self.create_calendar_event(appointment)
+                                except Exception as e:
+                                    print(f"Error creating calendar event: {e}")
 
                             # Mark as learned
                             self.draft_tracking['learned_from'].append(message_id)
