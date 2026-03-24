@@ -787,14 +787,14 @@ Von: {sender}
 Betreff: {subject}
 Grund: {reason}
 
--> draft | call | zeit [wann] | antwort [text] | spam | ignore"""
+!status für aktuelle Nummern | N draft | N call | N zeit [wann] | N antwort [text] | N spam | N ignore"""
 
         html = f"""<b>{emoji} [{pending_num}] {category.upper()}</b><br/>
 <b>Von:</b> {sender}<br/>
 <b>Betreff:</b> {subject}<br/>
 <b>Grund:</b> {reason}<br/>
 <br/>
-<code>draft</code> | <code>call</code> | <code>zeit [wann]</code> | <code>antwort [text]</code> | <code>spam</code> | <code>ignore</code>"""
+<code>!status</code> für aktuelle Nummern | <code>N draft</code> | <code>N call</code> | <code>N zeit [wann]</code> | <code>N antwort [text]</code> | <code>N spam</code> | <code>N ignore</code>"""
 
         if self._matrix_send_message(text, html):
             print(f"  Matrix notification sent for {sender}")
