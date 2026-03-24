@@ -4,6 +4,7 @@ import email
 from email.header import decode_header
 import os
 import socket
+import sqlite3
 from email.message import EmailMessage
 from anthropic import Anthropic
 from datetime import datetime
@@ -22,10 +23,8 @@ class EmailAssistant:
         """Initialize the email assistant with configuration."""
         self.load_config(config_path)
         self.anthropic = Anthropic(api_key=self.config['anthropic_api_key'])
+        self._init_db()
         self.connect_imap()
-        self.load_history()
-        self.load_learned_spam()
-        self.load_draft_tracking()
         self._load_article_index()
 
     def load_config(self, config_path: str):
@@ -33,89 +32,295 @@ class EmailAssistant:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
-    def load_learned_spam(self):
-        """Load learned spam patterns from JSON file."""
-        try:
-            with open('learned_spam.json', 'r') as f:
-                self.learned_spam = json.load(f)
-        except FileNotFoundError:
-            self.learned_spam = {
-                'keywords': [],
-                'senders': [],
-                'spam_emails': [],
-                'processed_message_ids': []  # Track which spam emails we've learned from
-            }
-            self.save_learned_spam()
+    def _init_db(self):
+        """Initialize SQLite database with all tables."""
+        os.makedirs('memory', exist_ok=True)
+        self.db_path = os.path.join('memory', 'email_assistant.db')
+        self._db_lock = threading.Lock()
+        self._db = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
+        self._db.row_factory = sqlite3.Row
 
-    def save_learned_spam(self):
-        """Save learned spam patterns to JSON file."""
-        with open('learned_spam.json', 'w') as f:
-            json.dump(self.learned_spam, f, indent=2)
+        self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS pending (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL DEFAULT 'decision',
+                sender TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                content TEXT DEFAULT '',
+                message_id TEXT DEFAULT '',
+                triage_category TEXT DEFAULT '',
+                triage_confidence REAL DEFAULT 0,
+                triage_reason TEXT DEFAULT '',
+                draft TEXT,
+                draft_raw TEXT,
+                appointment_stage TEXT,
+                appointment_time TEXT,
+                resolved INTEGER NOT NULL DEFAULT 0,
+                created TEXT NOT NULL
+            );
 
-    def load_draft_tracking(self):
-        """Load draft tracking data from JSON file."""
-        try:
-            with open('draft_tracking.json', 'r') as f:
-                self.draft_tracking = json.load(f)
-        except FileNotFoundError:
-            self.draft_tracking = {
-                'pending_drafts': [],  # Drafts waiting to be sent
-                'learned_from': [],  # Message IDs we've already learned from (drafts)
-                'manually_sent_learned': [],  # Message IDs of manually sent emails we've learned from
-                'processed_incoming_ids': []  # Message IDs of incoming emails already processed
-            }
-            self.save_draft_tracking()
+            CREATE TABLE IF NOT EXISTS contacts (
+                email TEXT PRIMARY KEY,
+                name TEXT DEFAULT '',
+                category_tags TEXT DEFAULT '[]',
+                topics TEXT DEFAULT '[]',
+                first_contact TEXT,
+                last_contact TEXT
+            );
 
-        # Ensure the new field exists in older versions
-        if 'manually_sent_learned' not in self.draft_tracking:
-            self.draft_tracking['manually_sent_learned'] = []
-            self.save_draft_tracking()
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                subject TEXT DEFAULT '',
+                email_content TEXT DEFAULT '',
+                response TEXT DEFAULT '',
+                created TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_sender ON conversations(sender);
+            CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations(created);
 
-        if 'processed_incoming_ids' not in self.draft_tracking:
-            self.draft_tracking['processed_incoming_ids'] = []
-            self.save_draft_tracking()
+            CREATE TABLE IF NOT EXISTS spam_senders (
+                sender TEXT PRIMARY KEY
+            );
 
-    def save_draft_tracking(self):
-        """Save draft tracking data to JSON file."""
-        with open('draft_tracking.json', 'w') as f:
-            json.dump(self.draft_tracking, f, indent=2)
+            CREATE TABLE IF NOT EXISTS spam_keywords (
+                keyword TEXT PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS processed_ids (
+                message_id TEXT PRIMARY KEY,
+                type TEXT NOT NULL,
+                created TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_drafts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                original_content TEXT DEFAULT '',
+                draft_response TEXT DEFAULT '',
+                original_message_id TEXT DEFAULT '',
+                calendar_appointment TEXT,
+                created TEXT NOT NULL
+            );
+        """)
+        self._db.commit()
+
+        # Migrate old JSON files if they exist
+        self._migrate_json_to_db()
+
+        # Cache spam data for fast blacklist checks
+        self._spam_senders = set(r[0] for r in self._db.execute("SELECT sender FROM spam_senders").fetchall())
+        self._spam_keywords = [r[0] for r in self._db.execute("SELECT keyword FROM spam_keywords").fetchall()]
+        print(f"✓ Database initialized ({self.db_path})")
+        print(f"  Spam senders: {len(self._spam_senders)}, keywords: {len(self._spam_keywords)}")
+
+    def _migrate_json_to_db(self):
+        """Migrate existing JSON files to SQLite, then rename to .bak."""
+        migrated = []
+
+        # Migrate learned_spam.json
+        if os.path.exists('learned_spam.json'):
+            try:
+                with open('learned_spam.json', 'r') as f:
+                    spam = json.load(f)
+                with self._db_lock:
+                    for s in spam.get('senders', []):
+                        self._db.execute("INSERT OR IGNORE INTO spam_senders(sender) VALUES(?)", (s,))
+                    for k in spam.get('keywords', []):
+                        self._db.execute("INSERT OR IGNORE INTO spam_keywords(keyword) VALUES(?)", (k,))
+                    for mid in spam.get('processed_message_ids', []):
+                        self._db.execute("INSERT OR IGNORE INTO processed_ids(message_id, type, created) VALUES(?, 'spam_learned', ?)",
+                                        (mid, datetime.now().isoformat()))
+                    self._db.commit()
+                os.rename('learned_spam.json', 'learned_spam.json.bak')
+                migrated.append('learned_spam.json')
+            except Exception as e:
+                print(f"  Error migrating learned_spam.json: {e}")
+
+        # Migrate draft_tracking.json
+        if os.path.exists('draft_tracking.json'):
+            try:
+                with open('draft_tracking.json', 'r') as f:
+                    tracking = json.load(f)
+                with self._db_lock:
+                    for mid in tracking.get('processed_incoming_ids', []):
+                        self._db.execute("INSERT OR IGNORE INTO processed_ids(message_id, type, created) VALUES(?, 'incoming', ?)",
+                                        (mid, datetime.now().isoformat()))
+                    for mid in tracking.get('learned_from', []):
+                        self._db.execute("INSERT OR IGNORE INTO processed_ids(message_id, type, created) VALUES(?, 'learned', ?)",
+                                        (mid, datetime.now().isoformat()))
+                    for mid in tracking.get('manually_sent_learned', []):
+                        self._db.execute("INSERT OR IGNORE INTO processed_ids(message_id, type, created) VALUES(?, 'manually_learned', ?)",
+                                        (mid, datetime.now().isoformat()))
+                    for draft in tracking.get('pending_drafts', []):
+                        cal = json.dumps(draft.get('calendar_appointment')) if draft.get('calendar_appointment') else None
+                        self._db.execute("""INSERT INTO pending_drafts(recipient, subject, original_content, draft_response,
+                                           original_message_id, calendar_appointment, created)
+                                           VALUES(?,?,?,?,?,?,?)""",
+                                        (draft['recipient'], draft['subject'], draft.get('original_content', ''),
+                                         draft.get('draft_response', ''), draft.get('original_message_id', ''),
+                                         cal, draft.get('timestamp', datetime.now().isoformat())))
+                    self._db.commit()
+                os.rename('draft_tracking.json', 'draft_tracking.json.bak')
+                migrated.append('draft_tracking.json')
+            except Exception as e:
+                print(f"  Error migrating draft_tracking.json: {e}")
+
+        # Migrate pending_decisions.json
+        pending_path = os.path.join('memory', 'categories', 'pending_decisions.json')
+        if os.path.exists(pending_path):
+            try:
+                with open(pending_path, 'r') as f:
+                    data = json.load(f)
+                items = data.values() if isinstance(data, dict) else data
+                with self._db_lock:
+                    for item in items:
+                        pid = item.get('id') or uuid.uuid4().hex[:6]
+                        self._db.execute("""INSERT OR IGNORE INTO pending(id, type, sender, subject, content, message_id,
+                                           triage_category, triage_confidence, triage_reason, draft, draft_raw,
+                                           appointment_stage, appointment_time, resolved, created)
+                                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        (pid, item.get('type', 'decision'), item.get('sender', ''),
+                                         item.get('subject', ''), item.get('content', ''),
+                                         item.get('message_id', ''), item.get('triage_category', ''),
+                                         item.get('triage_confidence', 0), item.get('triage_reason', ''),
+                                         item.get('draft'), item.get('draft_raw'),
+                                         item.get('appointment_stage'), item.get('appointment_time'),
+                                         1 if item.get('resolved') else 0,
+                                         item.get('created', datetime.now().isoformat())))
+                    self._db.commit()
+                os.rename(pending_path, pending_path + '.bak')
+                migrated.append('pending_decisions.json')
+            except Exception as e:
+                print(f"  Error migrating pending_decisions.json: {e}")
+
+        # Migrate per-contact conversation files
+        contacts_dir = os.path.join('memory', 'contacts')
+        if os.path.isdir(contacts_dir):
+            contact_files = [f for f in os.listdir(contacts_dir) if f.endswith('.json')]
+            if contact_files:
+                try:
+                    with self._db_lock:
+                        for filename in contact_files:
+                            filepath = os.path.join(contacts_dir, filename)
+                            with open(filepath, 'r') as f:
+                                contact = json.load(f)
+                            email_addr = contact.get('email', '')
+                            if not email_addr:
+                                continue
+                            self._db.execute("""INSERT OR IGNORE INTO contacts(email, name, category_tags, topics, first_contact, last_contact)
+                                               VALUES(?,?,?,?,?,?)""",
+                                            (email_addr, contact.get('name', ''),
+                                             json.dumps(contact.get('category_tags', [])),
+                                             json.dumps(contact.get('topics', [])),
+                                             contact.get('first_contact', ''),
+                                             contact.get('last_contact', '')))
+                            for conv in contact.get('conversations', []):
+                                self._db.execute("""INSERT INTO conversations(sender, subject, email_content, response, created)
+                                                   VALUES(?,?,?,?,?)""",
+                                                (email_addr, conv.get('subject', ''),
+                                                 conv.get('email_content', ''), conv.get('response', ''),
+                                                 conv.get('date', datetime.now().isoformat())))
+                        self._db.commit()
+                    # Rename contact dir
+                    os.rename(contacts_dir, contacts_dir + '.bak')
+                    migrated.append(f'{len(contact_files)} contact files')
+                except Exception as e:
+                    print(f"  Error migrating contacts: {e}")
+
+        # Migrate flat conversation_history.json (oldest format)
+        if os.path.exists('conversation_history.json'):
+            try:
+                with open('conversation_history.json', 'r') as f:
+                    old_history = json.load(f)
+                with self._db_lock:
+                    for email_addr, conversations in old_history.items():
+                        self._db.execute("""INSERT OR IGNORE INTO contacts(email, name, first_contact, last_contact)
+                                           VALUES(?,?,?,?)""",
+                                        (email_addr, email_addr.split('@')[0].replace('.', ' ').title(),
+                                         conversations[0]['date'] if conversations else '',
+                                         conversations[-1]['date'] if conversations else ''))
+                        for conv in conversations:
+                            self._db.execute("""INSERT INTO conversations(sender, subject, email_content, response, created)
+                                               VALUES(?,?,?,?,?)""",
+                                            (email_addr, conv.get('subject', ''),
+                                             conv.get('email_content', ''), conv.get('response', ''),
+                                             conv.get('date', '')))
+                    self._db.commit()
+                os.rename('conversation_history.json', 'conversation_history.json.bak')
+                migrated.append('conversation_history.json')
+            except Exception as e:
+                print(f"  Error migrating conversation_history.json: {e}")
+
+        if migrated:
+            print(f"  Migrated to DB: {', '.join(migrated)}")
+
+    # ---- DB helpers ----
+
+    def _db_is_processed(self, message_id: str, msg_type: str) -> bool:
+        """Check if a message ID has been processed."""
+        row = self._db.execute("SELECT 1 FROM processed_ids WHERE message_id=? AND type=?",
+                              (message_id, msg_type)).fetchone()
+        return row is not None
+
+    def _db_mark_processed(self, message_id: str, msg_type: str):
+        """Mark a message ID as processed."""
+        with self._db_lock:
+            self._db.execute("INSERT OR IGNORE INTO processed_ids(message_id, type, created) VALUES(?,?,?)",
+                            (message_id, msg_type, datetime.now().isoformat()))
+            self._db.commit()
+
+    def _db_has_conversation(self, sender: str) -> bool:
+        """Check if we have any conversation history with a sender."""
+        row = self._db.execute("SELECT 1 FROM conversations WHERE sender=? LIMIT 1", (sender,)).fetchone()
+        return row is not None
+
+    def _db_get_pending(self, pid: str) -> Optional[Dict]:
+        """Get a single pending item by ID."""
+        row = self._db.execute("SELECT * FROM pending WHERE id=?", (pid,)).fetchone()
+        return dict(row) if row else None
+
+    def _db_update_pending(self, pid: str, **kwargs):
+        """Update columns on a pending item."""
+        if not kwargs:
+            return
+        cols = ', '.join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [pid]
+        with self._db_lock:
+            self._db.execute(f"UPDATE pending SET {cols} WHERE id=?", vals)
+            self._db.commit()
 
     def mark_as_spam(self, email_data: Dict):
         """Mark an email as spam and learn keywords from it."""
-        # Check if we've already processed this email
         message_id = email_data.get('message_id', '')
-        if message_id and message_id in self.learned_spam['processed_message_ids']:
-            return  # Already learned from this email
+        if message_id and self._db_is_processed(message_id, 'spam_learned'):
+            return
 
-        # Store the full spam email for reference
-        self.learned_spam['spam_emails'].append({
-            'timestamp': datetime.now().isoformat(),
-            'sender': email_data['sender'],
-            'subject': email_data['subject'],
-            'content': email_data['content'][:200]  # Store first 200 chars
-        })
+        sender = email_data['sender']
+        with self._db_lock:
+            self._db.execute("INSERT OR IGNORE INTO spam_senders(sender) VALUES(?)", (sender,))
+            self._spam_senders.add(sender)
+            print(f"Added {sender} to spam sender list")
 
-        # Track that we've processed this email
-        if message_id:
-            self.learned_spam['processed_message_ids'].append(message_id)
+            # Extract 3-word phrases from subject
+            subject_words = email_data['subject'].split()
+            for i in range(len(subject_words)):
+                if i + 2 < len(subject_words):
+                    phrase = ' '.join(subject_words[i:i+3])
+                    if len(phrase) > 10:
+                        self._db.execute("INSERT OR IGNORE INTO spam_keywords(keyword) VALUES(?)", (phrase,))
+                        if phrase not in self._spam_keywords:
+                            self._spam_keywords.append(phrase)
+                            print(f"Learned spam keyword: {phrase}")
 
-        # Add sender to spam list if not already there
-        if email_data['sender'] not in self.learned_spam['senders']:
-            self.learned_spam['senders'].append(email_data['sender'])
-            print(f"Added {email_data['sender']} to spam sender list")
-
-        # Extract unique phrases from subject (3-5 words)
-        subject_words = email_data['subject'].split()
-        for i in range(len(subject_words)):
-            # Extract 3-word phrases
-            if i + 2 < len(subject_words):
-                phrase = ' '.join(subject_words[i:i+3])
-                if phrase not in self.learned_spam['keywords'] and len(phrase) > 10:
-                    self.learned_spam['keywords'].append(phrase)
-                    print(f"Learned spam keyword: {phrase}")
-
-        self.save_learned_spam()
-        print(f"Email from {email_data['sender']} marked as spam and patterns learned")
+            if message_id:
+                self._db.execute("INSERT OR IGNORE INTO processed_ids(message_id, type, created) VALUES(?, 'spam_learned', ?)",
+                                (message_id, datetime.now().isoformat()))
+            self._db.commit()
+        print(f"Email from {sender} marked as spam and patterns learned")
 
     def learn_from_spam_folder(self):
         """Check Junk/Spam folder and learn from emails there."""
@@ -154,7 +359,7 @@ class EmailAssistant:
                         message_id = (email_message['Message-ID'] or '').replace('\n', '').replace('\r', '').strip()
 
                         # Check if we've already learned from this email
-                        if message_id in self.learned_spam['processed_message_ids']:
+                        if message_id and self._db_is_processed(message_id, 'spam_learned'):
                             continue
 
                         # Learn from this spam email
@@ -213,210 +418,71 @@ class EmailAssistant:
             print(f"✗ IMAP reconnection failed: {e}")
             return False
 
-    def _sanitize_email_filename(self, email_addr: str) -> str:
-        """Convert email@example.com to email_example_com.json"""
-        return email_addr.replace('@', '_').replace('.', '_') + '.json'
-
-    def _create_contact(self, email_addr: str) -> Dict:
-        """Create a new contact profile."""
-        return {
-            'email': email_addr,
-            'name': email_addr.split('@')[0].replace('.', ' ').replace('_', ' ').title(),
-            'category_tags': [],
-            'topics': [],
-            'interaction_count': 0,
-            'first_contact': datetime.now().isoformat(),
-            'last_contact': datetime.now().isoformat(),
-            'conversations': []
-        }
-
-    def _save_contact(self, email_addr: str):
-        """Save a single contact file to memory/contacts/."""
-        contacts_dir = os.path.join('memory', 'contacts')
-        os.makedirs(contacts_dir, exist_ok=True)
-
-        filename = self._sanitize_email_filename(email_addr)
-        filepath = os.path.join(contacts_dir, filename)
-
-        contact = self._contacts.get(email_addr, self._create_contact(email_addr))
-        contact['conversations'] = self.conversation_history.get(email_addr, [])
-        contact['last_contact'] = datetime.now().isoformat()
-        contact['interaction_count'] = len(contact['conversations'])
-
-        with open(filepath, 'w') as f:
-            json.dump(contact, f, indent=2, ensure_ascii=False)
-
-    def _migrate_conversation_history(self):
-        """Migrate flat conversation_history.json to per-contact files under memory/contacts/.
-        Runs once, then renames the old file to .bak."""
-        print("Migrating conversation_history.json to per-contact files...")
-        contacts_dir = os.path.join('memory', 'contacts')
-        os.makedirs(contacts_dir, exist_ok=True)
-        os.makedirs(os.path.join('memory', 'categories'), exist_ok=True)
-
-        try:
-            with open('conversation_history.json', 'r') as f:
-                old_history = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            print("No conversation_history.json found or empty, skipping migration")
-            return
-
-        migrated = 0
-        for email_addr, conversations in old_history.items():
-            contact = self._create_contact(email_addr)
-            contact['conversations'] = conversations
-            contact['interaction_count'] = len(conversations)
-            if conversations:
-                dates = [conv['date'] for conv in conversations if 'date' in conv]
-                if dates:
-                    contact['first_contact'] = min(dates)
-                    contact['last_contact'] = max(dates)
-
-            filename = self._sanitize_email_filename(email_addr)
-            filepath = os.path.join(contacts_dir, filename)
-            with open(filepath, 'w') as f:
-                json.dump(contact, f, indent=2, ensure_ascii=False)
-            migrated += 1
-
-        # Rename old file to .bak
-        os.rename('conversation_history.json', 'conversation_history.json.bak')
-        print(f"Migration complete: {migrated} contacts migrated to memory/contacts/")
-        print("Old file renamed to conversation_history.json.bak")
-
-    def load_history(self):
-        """Load conversation history from per-contact files in memory/contacts/."""
-        contacts_dir = os.path.join('memory', 'contacts')
-
-        # Migrate if old format exists
-        if os.path.exists('conversation_history.json') and not os.path.isdir(contacts_dir):
-            self._migrate_conversation_history()
-
-        self.conversation_history = {}
-        self._contacts = {}
-
-        if os.path.isdir(contacts_dir):
-            for filename in os.listdir(contacts_dir):
-                if filename.endswith('.json'):
-                    filepath = os.path.join(contacts_dir, filename)
-                    try:
-                        with open(filepath, 'r') as f:
-                            contact = json.load(f)
-                        email_addr = contact['email']
-                        self.conversation_history[email_addr] = contact.get('conversations', [])
-                        self._contacts[email_addr] = contact
-                    except (json.JSONDecodeError, KeyError) as e:
-                        print(f"Error loading contact file {filename}: {e}")
-
-        # Create directories if they don't exist yet (fresh install)
-        os.makedirs(contacts_dir, exist_ok=True)
-        os.makedirs(os.path.join('memory', 'categories'), exist_ok=True)
-
-    def save_history(self):
-        """Save conversation history. Writes only the last updated contact file."""
-        if hasattr(self, '_last_updated_sender') and self._last_updated_sender:
-            self._save_contact(self._last_updated_sender)
-            self._last_updated_sender = None
+    def _ensure_contact(self, email_addr: str):
+        """Create contact record if it doesn't exist."""
+        name = email_addr.split('@')[0].replace('.', ' ').replace('_', ' ').title()
+        now = datetime.now().isoformat()
+        with self._db_lock:
+            self._db.execute("""INSERT OR IGNORE INTO contacts(email, name, first_contact, last_contact)
+                               VALUES(?,?,?,?)""", (email_addr, name, now, now))
+            self._db.commit()
 
     def _get_relevant_history(self, sender: str) -> str:
         """Get conversation history for a specific sender.
         Also cleans up conversations older than 14 weeks."""
-        if sender not in self.conversation_history:
-            return "No previous conversations with this sender."
-
-        # Clean up old conversations (older than 14 weeks = 98 days)
         self._cleanup_old_conversations(sender, weeks=14)
 
-        history = self.conversation_history[sender]
+        rows = self._db.execute(
+            "SELECT subject, email_content, response, created FROM conversations WHERE sender=? ORDER BY created DESC LIMIT 3",
+            (sender,)).fetchall()
+
+        if not rows:
+            return "No previous conversations with this sender."
+
         history_text = ""
-        for conv in history[-3:]:  # Last 3 conversations
-            history_text += f"\nDate: {conv['date']}\n"
-            history_text += f"Email: {conv['email_content']}\n"
-            history_text += f"Response: {conv['response']}\n"
+        for row in reversed(rows):  # oldest first
+            history_text += f"\nDate: {row['created']}\n"
+            history_text += f"Email: {row['email_content']}\n"
+            history_text += f"Response: {row['response']}\n"
 
         return history_text
 
     def _get_recent_emails_context(self, days: int = 10) -> str:
-        """Build a summary of all conversations from the last N days for global context.
-        Helps the assistant understand the broader email landscape."""
-        cutoff = datetime.now() - timedelta(days=days)
-        recent = []
+        """Build a summary of all conversations from the last N days for global context."""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        rows = self._db.execute(
+            "SELECT sender, subject, email_content, response, created FROM conversations WHERE created>? ORDER BY created DESC LIMIT 20",
+            (cutoff,)).fetchall()
 
-        for sender, conversations in self.conversation_history.items():
-            for conv in conversations:
-                try:
-                    conv_date = datetime.fromisoformat(conv['date'])
-                    if conv_date > cutoff:
-                        recent.append({
-                            'date': conv['date'],
-                            'sender': sender,
-                            'subject': conv.get('subject', ''),
-                            'snippet': conv.get('email_content', '')[:150],
-                            'responded': bool(conv.get('response', ''))
-                        })
-                except (ValueError, KeyError):
-                    continue
-
-        if not recent:
+        if not rows:
             return ""
 
-        # Sort by date, most recent first, limit to 20
-        recent.sort(key=lambda x: x['date'], reverse=True)
-        recent = recent[:20]
-
-        context = f"Recent email activity (last {days} days, {len(recent)} emails):\n"
-        for item in recent:
-            status = "replied" if item['responded'] else "unread"
-            context += f"- {item['date'][:10]} | {item['sender']} | {item['subject'][:60]} [{status}]\n"
+        context = f"Recent email activity (last {days} days, {len(rows)} emails):\n"
+        for row in rows:
+            status = "replied" if row['response'] else "unread"
+            context += f"- {row['created'][:10]} | {row['sender']} | {(row['subject'] or '')[:60]} [{status}]\n"
 
         return context
 
     def _cleanup_old_conversations(self, sender: str, weeks: int = 14):
         """Remove conversations older than the specified number of weeks."""
-        if sender not in self.conversation_history:
-            return
-
-        cutoff_date = datetime.now() - timedelta(weeks=weeks)
-        original_count = len(self.conversation_history[sender])
-
-        # Keep only conversations after the cutoff date
-        self.conversation_history[sender] = [
-            conv for conv in self.conversation_history[sender]
-            if datetime.fromisoformat(conv['date']) > cutoff_date
-        ]
-
-        removed_count = original_count - len(self.conversation_history[sender])
-        if removed_count > 0:
-            print(f"Cleaned up {removed_count} old conversations for {sender}")
-            self._save_contact(sender)
-
-        # If all conversations were removed, delete the sender entry
-        if not self.conversation_history[sender]:
-            del self.conversation_history[sender]
-            # Remove contact file too
-            contacts_dir = os.path.join('memory', 'contacts')
-            filepath = os.path.join(contacts_dir, self._sanitize_email_filename(sender))
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            if sender in self._contacts:
-                del self._contacts[sender]
+        cutoff = (datetime.now() - timedelta(weeks=weeks)).isoformat()
+        with self._db_lock:
+            result = self._db.execute("DELETE FROM conversations WHERE sender=? AND created<?", (sender, cutoff))
+            if result.rowcount > 0:
+                print(f"Cleaned up {result.rowcount} old conversations for {sender}")
+                self._db.commit()
 
     def update_history(self, email_data: Dict, response: str):
         """Update conversation history with new email and response."""
         sender = email_data['sender']
-        if sender not in self.conversation_history:
-            self.conversation_history[sender] = []
-        if sender not in self._contacts:
-            self._contacts[sender] = self._create_contact(sender)
-
-        self.conversation_history[sender].append({
-            'date': datetime.now().isoformat(),
-            'email_content': email_data['content'],
-            'subject': email_data['subject'],
-            'response': response
-        })
-
-        self._last_updated_sender = sender
-        self.save_history()
+        self._ensure_contact(sender)
+        now = datetime.now().isoformat()
+        with self._db_lock:
+            self._db.execute("INSERT INTO conversations(sender, subject, email_content, response, created) VALUES(?,?,?,?,?)",
+                            (sender, email_data.get('subject', ''), email_data.get('content', ''), response, now))
+            self._db.execute("UPDATE contacts SET last_contact=? WHERE email=?", (now, sender))
+            self._db.commit()
 
     def is_blacklisted(self, sender: str, subject: str, content: str) -> bool:
         """Check if email should be filtered out based on blacklist, automated senders, and keywords."""
@@ -467,7 +533,7 @@ class EmailAssistant:
                 return True
 
         # Check learned spam senders
-        if sender in self.learned_spam['senders']:
+        if sender in self._spam_senders:
             print(f"Email from {sender} filtered out (learned spam sender)")
             return True
 
@@ -487,7 +553,7 @@ class EmailAssistant:
                 return True
 
         # Check learned spam keywords
-        for keyword in self.learned_spam['keywords']:
+        for keyword in self._spam_keywords:
             if keyword.lower() in combined_text:
                 print(f"Email from {sender} filtered out (learned spam keyword: {keyword})")
                 return True
@@ -525,7 +591,7 @@ class EmailAssistant:
             # Check blacklist and filters
             # BUT: Don't filter if there's already a conversation with this sender
             # (e.g., customer replying to our manual response to their order confirmation)
-            has_conversation = sender in self.conversation_history and len(self.conversation_history[sender]) > 0
+            has_conversation = self._db_has_conversation(sender)
 
             if self.is_blacklisted(sender, subject, content) and not has_conversation:
                 # Check what type of blocked email this is
@@ -596,8 +662,7 @@ class EmailAssistant:
         """Classify an email into a triage category using a lightweight Claude call.
         Returns dict with category, confidence, and reason."""
         try:
-            has_history = email_data['sender'] in self.conversation_history and \
-                          len(self.conversation_history[email_data['sender']]) > 0
+            has_history = self._db_has_conversation(email_data['sender'])
 
             system_prompt = """You are an email triage classifier for a Swiss IT repair/privacy service business (yourdevice.ch).
 Classify the incoming email into exactly ONE category:
@@ -658,104 +723,45 @@ Has existing conversation: {has_history}"""
                 pass
             return {'category': 'needs_human', 'confidence': 0.0, 'reason': f'Classification error: {str(e)}'}
 
-    def _load_pending(self) -> Dict:
-        """Load pending items dict from file. Migrates old list format automatically."""
-        filepath = os.path.join('memory', 'categories', 'pending_decisions.json')
-        try:
-            with open(filepath, 'r') as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                # Migrate old list format to UUID-keyed dict
-                new_data = {}
-                for item in data:
-                    pid = item.get('id') or uuid.uuid4().hex[:6]
-                    item['id'] = pid
-                    if 'content' not in item:
-                        item['content'] = item.pop('content_preview', '')
-                    if 'draft' not in item:
-                        item['draft'] = None
-                    new_data[pid] = item
-                self._save_pending(new_data)
-                return new_data
-            return data
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    def _save_pending(self, pending: Dict):
-        """Save pending items dict to file."""
-        os.makedirs(os.path.join('memory', 'categories'), exist_ok=True)
-        filepath = os.path.join('memory', 'categories', 'pending_decisions.json')
-        with open(filepath, 'w') as f:
-            json.dump(pending, f, indent=2, ensure_ascii=False)
-
     def _save_pending_decision(self, email_data: Dict, triage: Dict) -> str:
         """Save email needing human decision. Returns the pending ID."""
-        pending = self._load_pending()
         pid = uuid.uuid4().hex[:6]
-        pending[pid] = {
-            'id': pid,
-            'type': 'decision',
-            'sender': email_data['sender'],
-            'subject': email_data['subject'],
-            'content': (email_data.get('content') or '')[:2000],
-            'message_id': email_data.get('message_id', ''),
-            'triage_category': triage['category'],
-            'triage_confidence': triage['confidence'],
-            'triage_reason': triage.get('reason', ''),
-            'draft': None,
-            'appointment_stage': None,
-            'created': datetime.now().isoformat(),
-            'resolved': False
-        }
-        self._save_pending(pending)
+        with self._db_lock:
+            self._db.execute("""INSERT INTO pending(id, type, sender, subject, content, message_id,
+                               triage_category, triage_confidence, triage_reason, created)
+                               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                            (pid, 'decision', email_data['sender'], email_data['subject'],
+                             (email_data.get('content') or '')[:2000], email_data.get('message_id', ''),
+                             triage['category'], triage['confidence'], triage.get('reason', ''),
+                             datetime.now().isoformat()))
+            self._db.commit()
         print(f"  Saved to pending [{pid}]: {triage['category']} - {triage.get('reason', '')}")
-        return pid
-
-    def _save_pending_draft(self, email_data: Dict, draft: str) -> str:
-        """Save auto-generated draft to pending for confirmation. Returns pending ID."""
-        pending = self._load_pending()
-        pid = uuid.uuid4().hex[:6]
-        clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', draft).strip()
-        pending[pid] = {
-            'id': pid,
-            'type': 'draft',
-            'sender': email_data['sender'],
-            'subject': email_data['subject'],
-            'content': (email_data.get('content') or '')[:2000],
-            'message_id': email_data.get('message_id', ''),
-            'triage_category': email_data.get('triage', {}).get('category', 'quick_answer'),
-            'draft': clean,
-            'draft_raw': draft,
-            'appointment_stage': None,
-            'created': datetime.now().isoformat(),
-            'resolved': False
-        }
-        self._save_pending(pending)
-        print(f"  Saved pending draft [{pid}] for {email_data['sender']}")
         return pid
 
     def _update_contact_from_triage(self, email_data: Dict, triage: Dict):
         """Update contact profile with triage information (category tags, topics)."""
         sender = email_data['sender']
-        if sender not in self._contacts:
-            self._contacts[sender] = self._create_contact(sender)
+        self._ensure_contact(sender)
 
-        contact = self._contacts[sender]
+        row = self._db.execute("SELECT category_tags, topics FROM contacts WHERE email=?", (sender,)).fetchone()
+        if not row:
+            return
 
-        # Add category tag if not already present
+        tags = json.loads(row['category_tags'] or '[]')
+        topics = json.loads(row['topics'] or '[]')
+
         category = triage['category']
-        if category in ('quick_answer', 'paid_consultation') and category not in contact['category_tags']:
-            contact['category_tags'].append(category)
+        if category in ('quick_answer', 'paid_consultation') and category not in tags:
+            tags.append(category)
 
-        # Extract topic from reason if meaningful
         reason = triage.get('reason', '')
-        if reason and len(reason) > 3:
-            # Keep topics list to max 10, avoid duplicates
-            if reason not in contact['topics'] and len(contact['topics']) < 10:
-                contact['topics'].append(reason)
+        if reason and len(reason) > 3 and reason not in topics and len(topics) < 10:
+            topics.append(reason)
 
-        self._contacts[sender] = contact
-        self._save_contact(sender)
+        with self._db_lock:
+            self._db.execute("UPDATE contacts SET category_tags=?, topics=?, last_contact=? WHERE email=?",
+                            (json.dumps(tags), json.dumps(topics), datetime.now().isoformat(), sender))
+            self._db.commit()
 
     # ---- Matrix Integration ----
 
@@ -979,50 +985,44 @@ Has existing conversation: {has_history}"""
             command = parts[1].lower()
             args = parts[2] if len(parts) > 2 else ''
 
-            pending = self._load_pending()
-            if pid not in pending:
+            item = self._db_get_pending(pid)
+            if not item:
                 self._matrix_send_message(f"❌ ID '{pid}' nicht gefunden. !status für aktuelle Liste.")
                 continue
 
-            item = pending[pid]
-            if item.get('resolved'):
+            if item['resolved']:
                 self._matrix_send_message(f"⚠️ [{pid}] bereits erledigt.")
                 continue
 
             if command == 'ok':
-                self._mx_send(pid, item, pending)
+                self._mx_send(pid, item)
             elif command == 'draft':
                 if args:
-                    # draft with instructions: generate with custom context
-                    self._mx_regenerate(pid, item, args, pending)
+                    self._mx_regenerate(pid, item, args)
                 else:
-                    # draft without args: Claude generates freely
-                    self._mx_generate_draft(pid, item, pending, 'quick_answer')
+                    self._mx_generate_draft(pid, item, 'quick_answer')
             elif command == 'call':
-                self._mx_generate_draft(pid, item, pending, 'paid_consultation')
+                self._mx_generate_draft(pid, item, 'paid_consultation')
             elif command == 'zeit':
-                self._mx_propose_appointment(pid, item, args, pending)
+                self._mx_propose_appointment(pid, item, args)
             elif command == 'ändern':
                 if not args:
                     self._matrix_send_message(f"❌ [{pid}] Was ändern? z.B. '{pid} ändern mach kürzer'")
                 else:
-                    self._mx_regenerate(pid, item, args, pending)
+                    self._mx_regenerate(pid, item, args)
             elif command == 'spam':
                 self.mark_as_spam({'sender': item['sender'], 'subject': item['subject'],
-                                   'content': item.get('content', ''), 'message_id': item.get('message_id', '')})
-                item['resolved'] = True
-                self._save_pending(pending)
+                                   'content': item['content'] or '', 'message_id': item['message_id'] or ''})
+                self._db_update_pending(pid, resolved=1)
                 self._matrix_send_html(f"🗑️ <b>Spam [{pid}]:</b> {item['sender']}<br/><i>Wird ab jetzt gefiltert.</i>")
             elif command == 'ignore':
-                item['resolved'] = True
-                self._save_pending(pending)
+                self._db_update_pending(pid, resolved=1)
                 self._matrix_send_html(f"🚫 <b>Ignoriert [{pid}]:</b> {item['sender']}")
             else:
                 self._matrix_send_message(f"❓ Unbekannt: '{command}'. !help für Befehle.")
 
     def _matrix_send_help(self):
-        pending = self._load_pending()
-        open_count = sum(1 for d in pending.values() if not d.get('resolved'))
+        open_count = self._db.execute("SELECT COUNT(*) FROM pending WHERE resolved=0").fetchone()[0]
         html = (f"<h4>📧 Email-Assistent</h4>"
                 f"<b>Model:</b> <code>{self.config['claude_model_name']}</code><br/>"
                 f"<b>Offene Items:</b> {open_count}<br/><br/>"
@@ -1040,27 +1040,26 @@ Has existing conversation: {has_history}"""
         self._matrix_send_html(html)
 
     def _matrix_send_status(self):
-        pending = self._load_pending()
-        open_items = [(pid, d) for pid, d in pending.items() if not d.get('resolved')]
-        if not open_items:
+        rows = self._db.execute("SELECT * FROM pending WHERE resolved=0 ORDER BY created DESC").fetchall()
+        if not rows:
             self._matrix_send_html("<i>Keine offenen Items.</i>")
             return
-        html = f"<b>{len(open_items)} offene Item(s):</b><br/><br/>"
-        for pid, d in open_items:
-            cat = d.get('triage_category', '?')
-            has_draft = "✅ Draft bereit" if d.get('draft') else "⏳ Kein Draft"
-            html += (f"<b>[{pid}]</b> {d['sender']}<br/>"
-                     f"&nbsp;&nbsp;📋 {d['subject']}<br/>"
+        html = f"<b>{len(rows)} offene Item(s):</b><br/><br/>"
+        for row in rows:
+            cat = row['triage_category'] or '?'
+            has_draft = "✅ Draft bereit" if row['draft'] else "⏳ Kein Draft"
+            html += (f"<b>[{row['id']}]</b> {row['sender']}<br/>"
+                     f"&nbsp;&nbsp;📋 {row['subject']}<br/>"
                      f"&nbsp;&nbsp;<code>{cat}</code> | {has_draft}<br/><br/>")
         self._matrix_send_html(html)
 
-    def _mx_generate_draft(self, pid: str, item: Dict, pending: Dict, category: str):
+    def _mx_generate_draft(self, pid: str, item: Dict, category: str):
         """Generate a draft for a pending item and show it in Matrix."""
         email_data = {
             'sender': item['sender'],
             'subject': item['subject'],
-            'content': item.get('content', ''),
-            'message_id': item.get('message_id', ''),
+            'content': item['content'] or '',
+            'message_id': item['message_id'] or '',
             'triage': {'category': category}
         }
         response = self.generate_response(email_data)
@@ -1068,9 +1067,7 @@ Has existing conversation: {has_history}"""
             self._matrix_send_message(f"❌ [{pid}] Fehler: {response}")
             return
         clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
-        item['draft'] = clean
-        item['draft_raw'] = response
-        self._save_pending(pending)
+        self._db_update_pending(pid, draft=clean, draft_raw=response)
         cat_label = "💰 Beratungsangebot (135 CHF/h)" if category == 'paid_consultation' else "✅ Draft"
         html = (f"<b>{cat_label} [{pid}]</b><br/>"
                 f"<b>An:</b> {item['sender']}<br/><br/>"
@@ -1078,13 +1075,13 @@ Has existing conversation: {has_history}"""
                 f"<code>{pid} ok</code> (senden) | <code>{pid} ändern [anweisung]</code>")
         self._matrix_send_html(html)
 
-    def _mx_propose_appointment(self, pid: str, item: Dict, time_str: str, pending: Dict):
+    def _mx_propose_appointment(self, pid: str, item: Dict, time_str: str):
         """Generate appointment proposal draft."""
         email_data = {
             'sender': item['sender'],
             'subject': item['subject'],
-            'content': item.get('content', '') + f"\n\n[SYSTEM: Schlage folgenden Termin vor: {time_str}]",
-            'message_id': item.get('message_id', ''),
+            'content': (item['content'] or '') + f"\n\n[SYSTEM: Schlage folgenden Termin vor: {time_str}]",
+            'message_id': item['message_id'] or '',
             'triage': {'category': 'quick_answer'}
         }
         response = self.generate_response(email_data)
@@ -1092,11 +1089,7 @@ Has existing conversation: {has_history}"""
             self._matrix_send_message(f"❌ [{pid}] Fehler: {response}")
             return
         clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
-        item['draft'] = clean
-        item['draft_raw'] = response
-        item['appointment_stage'] = 'proposed'
-        item['appointment_time'] = time_str
-        self._save_pending(pending)
+        self._db_update_pending(pid, draft=clean, draft_raw=response, appointment_stage='proposed', appointment_time=time_str)
         html = (f"<b>📅 Terminvorschlag [{pid}]</b><br/>"
                 f"<b>An:</b> {item['sender']}<br/>"
                 f"<b>Zeit:</b> {time_str}<br/><br/>"
@@ -1104,13 +1097,13 @@ Has existing conversation: {has_history}"""
                 f"<code>{pid} ok</code> (senden + Kalender) | <code>{pid} ändern [anweisung]</code>")
         self._matrix_send_html(html)
 
-    def _mx_regenerate(self, pid: str, item: Dict, instructions: str, pending: Dict):
+    def _mx_regenerate(self, pid: str, item: Dict, instructions: str):
         """Regenerate draft with custom instructions."""
         email_data = {
             'sender': item['sender'],
             'subject': item['subject'],
-            'content': item.get('content', '') + f"\n\n[SYSTEM: {instructions}]",
-            'message_id': item.get('message_id', ''),
+            'content': (item['content'] or '') + f"\n\n[SYSTEM: {instructions}]",
+            'message_id': item['message_id'] or '',
             'triage': {'category': 'quick_answer'}
         }
         response = self.generate_response(email_data)
@@ -1118,33 +1111,30 @@ Has existing conversation: {has_history}"""
             self._matrix_send_message(f"❌ [{pid}] Fehler: {response}")
             return
         clean = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', response).strip()
-        item['draft'] = clean
-        item['draft_raw'] = response
-        self._save_pending(pending)
+        self._db_update_pending(pid, draft=clean, draft_raw=response)
         html = (f"<b>✏️ Draft aktualisiert [{pid}]</b><br/>"
                 f"<b>An:</b> {item['sender']}<br/><br/>"
                 f"<b>Entwurf:</b><br/><pre>{clean}</pre><br/>"
                 f"<code>{pid} ok</code> (senden) | <code>{pid} ändern [anweisung]</code>")
         self._matrix_send_html(html)
 
-    def _mx_send(self, pid: str, item: Dict, pending: Dict):
+    def _mx_send(self, pid: str, item: Dict):
         """Send the draft for a pending item via SMTP."""
-        if not item.get('draft'):
+        if not item['draft']:
             self._matrix_send_message(f"❌ [{pid}] Kein Draft. Erst '{pid} draft' aufrufen.")
             return
         to = item['sender']
         subject = item['subject'] if item['subject'].startswith('Re:') else f"Re: {item['subject']}"
-        body_raw = item.get('draft_raw', item['draft'])
-        in_reply_to = item.get('message_id', '')
+        body_raw = item['draft_raw'] or item['draft']
+        in_reply_to = item['message_id'] or ''
 
         if self.send_via_smtp(to, subject, body_raw, in_reply_to):
             email_data = {'sender': item['sender'], 'subject': item['subject'],
-                          'content': item.get('content', ''), 'message_id': item.get('message_id', '')}
+                          'content': item['content'] or '', 'message_id': item['message_id'] or ''}
             self.update_history(email_data, item['draft'])
-            item['resolved'] = True
-            self._save_pending(pending)
+            self._db_update_pending(pid, resolved=1)
             cal_note = ""
-            if item.get('appointment_stage') == 'proposed' and item.get('appointment_time'):
+            if item['appointment_stage'] == 'proposed' and item['appointment_time']:
                 cal_note = f"<br/>📅 Kalender-Eintrag für: {item['appointment_time']}"
             self._matrix_send_html(f"📤 <b>Gesendet [{pid}]</b><br/>An: {to}{cal_note}")
         else:
@@ -1399,25 +1389,22 @@ Inhalt: {email_data['content']}"""
 
         # Parse calendar data now and store in tracking
         appointment = self.parse_calendar_marker(response, email_data['sender'], subject)
-
-        entry = {
-            'timestamp': datetime.now().isoformat(),
-            'recipient': email_data['sender'],
-            'subject': email_data['subject'],
-            'original_content': email_data['content'],
-            'draft_response': response,
-            'original_message_id': email_data['message_id']
-        }
+        cal_json = None
         if appointment:
-            entry['calendar_appointment'] = {
+            cal_json = json.dumps({
                 'title': appointment['title'],
                 'start': appointment['start'].isoformat(),
                 'end': appointment['end'].isoformat(),
                 'location': appointment.get('location', ''),
                 'description': appointment.get('description', '')
-            }
-        self.draft_tracking['pending_drafts'].append(entry)
-        self.save_draft_tracking()
+            })
+
+        with self._db_lock:
+            self._db.execute("""INSERT INTO pending_drafts(recipient, subject, original_content, draft_response,
+                               original_message_id, calendar_appointment, created) VALUES(?,?,?,?,?,?,?)""",
+                            (email_data['sender'], email_data['subject'], email_data['content'],
+                             response, email_data['message_id'], cal_json, datetime.now().isoformat()))
+            self._db.commit()
 
     def send_via_smtp(self, to: str, subject: str, body: str, in_reply_to: str = '') -> bool:
         """Send an email via SMTP and remove the corresponding draft from IMAP."""
@@ -1615,17 +1602,13 @@ Inhalt: {email_data['content']}"""
         sent_folders = ['Sent', 'INBOX.Sent', '[Gmail]/Sent Mail', 'Sent Items']
         learned_count = 0
 
-        # Clean up old pending drafts (older than 30 days - probably never sent)
-        cutoff_date = datetime.now() - timedelta(days=30)
-        old_count = len(self.draft_tracking['pending_drafts'])
-        self.draft_tracking['pending_drafts'] = [
-            draft for draft in self.draft_tracking['pending_drafts']
-            if datetime.fromisoformat(draft['timestamp']) > cutoff_date
-        ]
-        new_count = len(self.draft_tracking['pending_drafts'])
-        if old_count > new_count:
-            print(f"Cleaned up {old_count - new_count} old pending drafts (>30 days)")
-            self.save_draft_tracking()
+        # Clean up old pending drafts (older than 30 days)
+        cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+        with self._db_lock:
+            result = self._db.execute("DELETE FROM pending_drafts WHERE created<?", (cutoff,))
+            if result.rowcount > 0:
+                print(f"Cleaned up {result.rowcount} old pending drafts (>30 days)")
+                self._db.commit()
 
         # Check sent emails from last 7 days (covers weekends and short breaks)
         week_ago = (datetime.now() - timedelta(days=7)).strftime('%d-%b-%Y')
@@ -1667,8 +1650,9 @@ Inhalt: {email_data['content']}"""
                     continue  # No emails in this folder
 
                 sent_emails = message_numbers[0].split()
+                pending_draft_count = self._db.execute("SELECT COUNT(*) FROM pending_drafts").fetchone()[0]
                 print(f"Found {len(sent_emails)} sent emails in {folder} to check")
-                print(f"Pending drafts to match: {len(self.draft_tracking['pending_drafts'])}")
+                print(f"Pending drafts to match: {pending_draft_count}")
 
                 for idx, num in enumerate(sent_emails):
                     try:
@@ -1682,7 +1666,7 @@ Inhalt: {email_data['content']}"""
                         message_id = (hdr_message['Message-ID'] or '').replace('\n', '').replace('\r', '').strip()
 
                         # Skip if already learned - no need to fetch full body
-                        if message_id and message_id in self.draft_tracking['learned_from']:
+                        if message_id and (self._db_is_processed(message_id, 'learned') or self._db_is_processed(message_id, 'manually_learned')):
                             print(f"    Already learned from this sent email, skipping")
                             continue
 
@@ -1722,27 +1706,25 @@ Inhalt: {email_data['content']}"""
 
                         # Try to match with a pending draft
                         matched_draft = None
-                        if not self.draft_tracking['pending_drafts']:
+                        db_drafts = self._db.execute("SELECT * FROM pending_drafts").fetchall()
+                        if not db_drafts:
                             print(f"    ✗ No pending drafts to match against")
                         else:
-                            for i, draft in enumerate(self.draft_tracking['pending_drafts']):
-                                print(f"    Checking draft {i+1}/{len(self.draft_tracking['pending_drafts'])}")
+                            for i, draft in enumerate(db_drafts):
+                                print(f"    Checking draft {i+1}/{len(db_drafts)}")
                                 print(f"      Draft To: {draft['recipient']}")
-                                # Decode draft subject too (it might be encoded)
                                 decoded_draft_subject = self.decode_mime_header(draft['subject'])
                                 print(f"      Draft Subject (decoded): {decoded_draft_subject}")
-                                print(f"      Draft Message ID: {draft.get('original_message_id', 'N/A')}")
+                                print(f"      Draft Message ID: {draft['original_message_id'] or 'N/A'}")
 
-                                # Match by recipient and subject similarity
                                 if (draft['recipient'].lower() == recipient.lower() and
                                     decoded_draft_subject.lower() in subject.lower()):
                                     print(f"      ✓ Matched by recipient + subject!")
-                                    matched_draft = draft
+                                    matched_draft = dict(draft)
                                     break
-                                # Or match by In-Reply-To header
-                                elif in_reply_to and draft.get('original_message_id') == in_reply_to:
+                                elif in_reply_to and draft['original_message_id'] == in_reply_to:
                                     print(f"      ✓ Matched by In-Reply-To header!")
-                                    matched_draft = draft
+                                    matched_draft = dict(draft)
                                     break
                                 else:
                                     print(f"      ✗ No match")
@@ -1751,7 +1733,7 @@ Inhalt: {email_data['content']}"""
                             print(f"    ✗ No matching draft found")
 
                             # Check if we've already learned from this sent email
-                            if message_id in self.draft_tracking['manually_sent_learned']:
+                            if message_id and self._db_is_processed(message_id, 'manually_learned'):
                                 print(f"    Already learned from this sent email, skipping")
                                 continue
 
@@ -1792,8 +1774,7 @@ Inhalt: {email_data['content']}"""
                                     self.update_history(customer_email_data, content)
 
                                     # Track that we processed this email to avoid reprocessing
-                                    self.draft_tracking['manually_sent_learned'].append(message_id)
-                                    self.save_draft_tracking()
+                                    self._db_mark_processed(message_id, 'manually_learned')
                                     print(f"    Tracked Message-ID to prevent reprocessing")
                                 else:
                                     # Save to conversation history
@@ -1807,8 +1788,7 @@ Inhalt: {email_data['content']}"""
                                         self.create_calendar_event(appointment)
 
                                     # Track that we learned from this sent email
-                                    self.draft_tracking['manually_sent_learned'].append(message_id)
-                                    self.save_draft_tracking()
+                                    self._db_mark_processed(message_id, 'manually_learned')
 
                                     learned_count += 1
                             else:
@@ -1830,8 +1810,7 @@ Inhalt: {email_data['content']}"""
                                     self.create_calendar_event(appointment)
 
                                 # Track that we processed this email to avoid reprocessing
-                                self.draft_tracking['manually_sent_learned'].append(message_id)
-                                self.save_draft_tracking()
+                                self._db_mark_processed(message_id, 'manually_learned')
 
                         if matched_draft:
                             # Found a match! Learn from the sent email
@@ -1848,7 +1827,8 @@ Inhalt: {email_data['content']}"""
                             print(f"    Updated conversation history for {matched_draft['recipient']}")
 
                             # Create calendar event from stored appointment data (marker stripped from IMAP draft)
-                            cal_data = matched_draft.get('calendar_appointment')
+                            cal_raw = matched_draft.get('calendar_appointment')
+                            cal_data = json.loads(cal_raw) if cal_raw else None
                             if cal_data:
                                 try:
                                     from datetime import datetime as dt
@@ -1865,9 +1845,10 @@ Inhalt: {email_data['content']}"""
                                     print(f"Error creating calendar event: {e}")
 
                             # Mark as learned
-                            self.draft_tracking['learned_from'].append(message_id)
-                            self.draft_tracking['pending_drafts'].remove(matched_draft)
-                            self.save_draft_tracking()
+                            self._db_mark_processed(message_id, 'learned')
+                            with self._db_lock:
+                                self._db.execute("DELETE FROM pending_drafts WHERE id=?", (matched_draft['id'],))
+                                self._db.commit()
 
                             learned_count += 1
 
@@ -2259,7 +2240,7 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                     try:
                         # Check if we've already processed this incoming email
                         message_id = email_data.get('message_id', '')
-                        if message_id and message_id in self.draft_tracking['processed_incoming_ids']:
+                        if message_id and self._db_is_processed(message_id, 'incoming'):
                             print(f"Email from {email_data['sender']} already processed (ID: {message_id[:20]}...), skipping")
                             continue
 
@@ -2289,26 +2270,22 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                     self.mark_as_spam(email_data)
                                     self.move_to_junk(email_data['uid'])
                                 if message_id:
-                                    self.draft_tracking['processed_incoming_ids'].append(message_id)
-                                    self.save_draft_tracking()
+                                    self._db_mark_processed(message_id, 'incoming')
                                 continue
 
                             if category == 'order_notification':
-                                has_conv = email_data['sender'] in self.conversation_history and \
-                                           len(self.conversation_history[email_data['sender']]) > 0
+                                has_conv = self._db_has_conversation(email_data['sender'])
                                 if not has_conv:
                                     print(f"  Triage: order_notification, no conversation, skipping")
                                     if message_id:
-                                        self.draft_tracking['processed_incoming_ids'].append(message_id)
-                                        self.save_draft_tracking()
+                                        self._db_mark_processed(message_id, 'incoming')
                                     continue
 
                         # All real emails -> pending for human decision via Matrix
                         pid = self._save_pending_decision(email_data, triage if triage_enabled else {'category': 'unclassified', 'confidence': 0, 'reason': ''})
                         self._matrix_notify_pending(email_data, triage if triage_enabled else {'category': 'unclassified', 'confidence': 0, 'reason': ''}, pid)
                         if message_id:
-                            self.draft_tracking['processed_incoming_ids'].append(message_id)
-                            self.save_draft_tracking()
+                            self._db_mark_processed(message_id, 'incoming')
                         print(f"  Pending [{pid}] for {email_data['sender']}")
                     except Exception as e:
                         print(f"Error processing email from {email_data['sender']}: {str(e)}")
