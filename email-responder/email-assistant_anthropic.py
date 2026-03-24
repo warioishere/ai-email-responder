@@ -186,8 +186,8 @@ class EmailAssistant:
     def connect_imap(self):
         """Connect to IMAP server."""
         try:
-            socket.setdefaulttimeout(30)
             self.imap = imaplib.IMAP4_SSL(self.config['imap_server'])
+            self.imap.socket().settimeout(30)
             self.imap.login(self.config['email'], self.config['password'])
             print("✓ IMAP connection established")
         except Exception as e:
@@ -203,8 +203,8 @@ class EmailAssistant:
             except:
                 pass  # Connection already dead
 
-            socket.setdefaulttimeout(30)
             self.imap = imaplib.IMAP4_SSL(self.config['imap_server'])
+            self.imap.socket().settimeout(30)
             self.imap.login(self.config['email'], self.config['password'])
             print("✓ IMAP reconnection successful")
             return True
