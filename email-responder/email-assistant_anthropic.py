@@ -983,9 +983,7 @@ Grund: {reason}
             else:
                 _, target = pending[-1]  # default: most recent
 
-            if command == 'send':
-                self._handle_matrix_send(target_idx)
-            elif command == 'draft':
+            if command == 'draft':
                 self._handle_matrix_draft(target, decisions, filepath)
             elif command == 'call':
                 self._handle_matrix_call(target, decisions, filepath)
@@ -2287,7 +2285,7 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                         f"Betreff: {subject}\n"
                                         f"Kategorie: {cat}\n\n"
                                         f"Entwurf:\n{preview}{'...' if len(clean_preview) > 300 else ''}\n\n"
-                                        f"{num} send | {num} ignore")
+                                        f"Draft im Mailclient prüfen und manuell senden.")
                                 self._matrix_send_message(text)
                         else:
                             print(f"Skipping draft save due to error for {email_data['sender']}")
