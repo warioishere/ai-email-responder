@@ -828,15 +828,15 @@ Has existing conversation: {has_history}"""
                 f"Betreff: {subject}\n"
                 f"Grund: {reason}\n\n"
                 f"Email:\n{content}\n\n"
-                f"{pid} draft | {pid} call | {pid} zeit [wann] | {pid} antwort [text] | {pid} spam | {pid} ignore")
+                f"{pid} draft | {pid} draft [anweisung] | {pid} call | {pid} zeit [wann] | {pid} spam | {pid} ignore")
 
         html = (f"<b>{emoji} [{pid}] {category.upper()}</b><br/>"
                 f"<b>Von:</b> {sender}<br/>"
                 f"<b>Betreff:</b> {subject}<br/>"
                 f"<b>Grund:</b> <i>{reason}</i><br/><br/>"
                 f"<b>Email:</b><br/><pre>{content}</pre><br/>"
-                f"<code>{pid} draft</code> | <code>{pid} call</code> | <code>{pid} zeit [wann]</code> | "
-                f"<code>{pid} antwort [text]</code> | <code>{pid} spam</code> | <code>{pid} ignore</code>")
+                f"<code>{pid} draft</code> | <code>{pid} draft [anweisung]</code> | <code>{pid} call</code> | "
+                f"<code>{pid} zeit [wann]</code> | <code>{pid} spam</code> | <code>{pid} ignore</code>")
 
         if self._matrix_send_message(text, html):
             print(f"  Matrix notification sent for {sender} [{pid}]")
@@ -992,13 +992,21 @@ Has existing conversation: {has_history}"""
             if command == 'ok':
                 self._mx_send(pid, item, pending)
             elif command == 'draft':
-                self._mx_generate_draft(pid, item, pending, 'quick_answer')
+                if args:
+                    # draft with instructions: generate with custom context
+                    self._mx_regenerate(pid, item, args, pending)
+                else:
+                    # draft without args: Claude generates freely
+                    self._mx_generate_draft(pid, item, pending, 'quick_answer')
             elif command == 'call':
                 self._mx_generate_draft(pid, item, pending, 'paid_consultation')
             elif command == 'zeit':
                 self._mx_propose_appointment(pid, item, args, pending)
-            elif command in ('ändern', 'antwort'):
-                self._mx_regenerate(pid, item, args, pending)
+            elif command == 'ändern':
+                if not args:
+                    self._matrix_send_message(f"❌ [{pid}] Was ändern? z.B. '{pid} ändern mach kürzer'")
+                else:
+                    self._mx_regenerate(pid, item, args, pending)
             elif command == 'spam':
                 self.mark_as_spam({'sender': item['sender'], 'subject': item['subject'],
                                    'content': item.get('content', ''), 'message_id': item.get('message_id', '')})
@@ -1019,12 +1027,12 @@ Has existing conversation: {has_history}"""
                 f"<b>Model:</b> <code>{self.config['claude_model_name']}</code><br/>"
                 f"<b>Offene Items:</b> {open_count}<br/><br/>"
                 f"<b>[id]</b> = 6-stellige ID aus der Notification<br/><br/>"
-                f"<code>[id] ok</code> — Draft senden<br/>"
-                f"<code>[id] draft</code> — Draft generieren<br/>"
+                f"<code>[id] draft</code> — Claude generiert Antwort<br/>"
+                f"<code>[id] draft [anweisung]</code> — Claude generiert mit deiner Anweisung<br/>"
                 f"<code>[id] call</code> — Beratungsangebot (135 CHF/h)<br/>"
                 f"<code>[id] zeit [wann]</code> — Terminvorschlag erstellen<br/>"
-                f"<code>[id] ändern [text]</code> — Draft anpassen<br/>"
-                f"<code>[id] antwort [text]</code> — Draft mit Anweisung<br/>"
+                f"<code>[id] ok</code> — Draft senden<br/>"
+                f"<code>[id] ändern [text]</code> — bestehenden Draft anpassen<br/>"
                 f"<code>[id] spam</code> — Als Spam markieren<br/>"
                 f"<code>[id] ignore</code> — Ignorieren<br/><br/>"
                 f"<code>!status</code> — Alle offenen Items<br/>"
