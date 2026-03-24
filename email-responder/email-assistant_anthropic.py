@@ -1539,27 +1539,26 @@ Inhalt: {email_data['content']}"""
                 for idx, num in enumerate(sent_emails):
                     try:
                         print(f"  [{idx+1}/{len(sent_emails)}] Fetching email ID {num.decode()}...")
+                        # Fetch only headers first to check Message-ID before loading full body
+                        _, hdr_data = self.imap.fetch(num, '(RFC822.HEADER)')
+                        if not hdr_data or not hdr_data[0] or len(hdr_data[0]) < 2:
+                            print(f"    ERROR: Failed to fetch headers for #{num.decode()}")
+                            continue
+                        hdr_message = email.message_from_bytes(hdr_data[0][1])
+                        message_id = (hdr_message['Message-ID'] or '').replace('\n', '').replace('\r', '').strip()
+
+                        # Skip if already learned - no need to fetch full body
+                        if message_id and message_id in self.draft_tracking['learned_from']:
+                            print(f"    Already learned from this sent email, skipping")
+                            continue
+
+                        # Now fetch full body only if needed
                         _, msg_data = self.imap.fetch(num, '(RFC822)')
                         if not msg_data or not msg_data[0] or len(msg_data[0]) < 2:
                             print(f"    ERROR: Failed to fetch email #{num.decode()}")
                             continue
                         email_body = msg_data[0][1]
                         email_message = email.message_from_bytes(email_body)
-
-                        # Debug: Show subject immediately to find 19530
-                        try:
-                            raw_subject_debug = (email_message['Subject'] or '').replace('\n', ' ').replace('\r', ' ').strip()
-                            subject_debug = self.decode_mime_header(raw_subject_debug)
-                            print(f"    Decoded subject (FULL): {subject_debug}")
-                            if '19530' in subject_debug or '19530' in raw_subject_debug:
-                                print(f"    >>> FOUND 19530 IN EMAIL #{num.decode()}")
-                                raw_to_debug = (email_message['To'] or '').replace('\n', ' ').replace('\r', ' ').strip()
-                                decoded_to_debug = self.decode_mime_header(raw_to_debug)
-                                print(f"    >>> To (decoded): {decoded_to_debug}")
-                        except Exception as e:
-                            print(f"    ERROR in debug code: {e}")
-                            import traceback
-                            traceback.print_exc()
 
                         content = self._extract_text_content(email_message)
 
@@ -1569,22 +1568,15 @@ Inhalt: {email_data['content']}"""
                         recipient = email.utils.parseaddr(decoded_to)[1]
 
                         raw_subject = (email_message['Subject'] or '').replace('\n', ' ').replace('\r', ' ').strip()
-                        # Decode MIME encoded headers
                         subject = self.decode_mime_header(raw_subject)
-                        message_id = (email_message['Message-ID'] or '').replace('\n', '').replace('\r', '').strip()
                         in_reply_to = (email_message.get('In-Reply-To', '') or '').replace('\n', '').replace('\r', '').strip()
 
                         print(f"\n  Checking sent email:")
-                        print(f"    To (raw): {raw_to[:80]}")  # First 80 chars of raw To
+                        print(f"    To (raw): {raw_to[:80]}")
                         print(f"    To (decoded): {decoded_to[:80]}")
                         print(f"    To (final): {recipient}")
                         print(f"    Subject (decoded): {subject}")
                         print(f"    In-Reply-To: {in_reply_to}")
-
-                        # Check if we've already learned from this email
-                        if message_id in self.draft_tracking['learned_from']:
-                            print(f"    Already learned from this email, skipping")
-                            continue
 
                         # Try to match with a pending draft
                         matched_draft = None
