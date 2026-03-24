@@ -1068,13 +1068,15 @@ Grund: {reason}
         body = draft['draft_response']
         in_reply_to = draft.get('original_message_id', '')
 
+        has_calendar = 'CALENDAR_MARKER' in body
         if self.send_via_smtp(to, subject, body, in_reply_to):
             drafts.pop(idx)
             self.draft_tracking['pending_drafts'] = drafts
             self.save_draft_tracking()
+            cal_info = " 📅 Kalender-Eintrag erstellt." if has_calendar else ""
             self._matrix_send_html(
                 f"📤 <b>Gesendet an {to}</b><br/>"
-                f"<i>{subject}</i>"
+                f"<i>{subject}</i>{cal_info}"
             )
         else:
             self._matrix_send_message(f"❌ Senden fehlgeschlagen. Bitte manuell senden.")
@@ -1385,6 +1387,10 @@ Inhalt: {email_data['content']}"""
     def send_via_smtp(self, to: str, subject: str, body: str, in_reply_to: str = '') -> bool:
         """Send an email via SMTP and remove the corresponding draft from IMAP."""
         try:
+            # Parse and strip CALENDAR_MARKER before sending
+            appointment = self.parse_calendar_marker(body, to, subject)
+            clean_body = re.sub(r'\s*CALENDAR_MARKER\|[^\n]*', '', body).strip()
+
             msg = EmailMessage()
             msg['From'] = self.config['email']
             msg['To'] = to
@@ -1392,7 +1398,7 @@ Inhalt: {email_data['content']}"""
             if in_reply_to:
                 msg['In-Reply-To'] = in_reply_to
                 msg['References'] = in_reply_to
-            msg.set_content(self.remove_markdown(body))
+            msg.set_content(self.remove_markdown(clean_body))
 
             smtp_server = self.config.get('smtp_server', self.config['imap_server'])
             smtp_port = self.config.get('smtp_port', 587)
@@ -1403,6 +1409,11 @@ Inhalt: {email_data['content']}"""
                 smtp.send_message(msg)
 
             print(f"✓ Email sent to {to}: {subject}")
+
+            # Create calendar event if marker was found
+            if appointment and self.config.get('enable_calendar', True):
+                if self.create_calendar_event(appointment):
+                    print(f"  Calendar event created: {appointment.get('title')}")
 
             # Remove matching draft from IMAP Drafts folder
             try:
