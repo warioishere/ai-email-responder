@@ -1098,11 +1098,13 @@ Has existing conversation: {has_history}"""
         self._matrix_send_html(html)
 
     def _mx_regenerate(self, pid: str, item: Dict, instructions: str):
-        """Regenerate draft with custom instructions."""
+        """Regenerate draft with custom instructions. Includes existing draft as context."""
+        existing_draft = item.get('draft') or item['draft']
+        system_instruction = f"[SYSTEM: Hier ist der aktuelle Entwurf:\n\n{existing_draft}\n\nÄndere diesen Entwurf nach folgender Anweisung: {instructions}\n\nWICHTIG: Ändere NUR was die Anweisung sagt. Behalte den Rest des Textes bei.]" if existing_draft else f"[SYSTEM: {instructions}]"
         email_data = {
             'sender': item['sender'],
             'subject': item['subject'],
-            'content': (item['content'] or '') + f"\n\n[SYSTEM: {instructions}]",
+            'content': (item['content'] or '') + f"\n\n{system_instruction}",
             'message_id': item['message_id'] or '',
             'triage': {'category': 'quick_answer'}
         }
