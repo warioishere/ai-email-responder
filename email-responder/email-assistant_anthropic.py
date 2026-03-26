@@ -588,29 +588,23 @@ class EmailAssistant:
             subject = self.decode_mime_header(raw_subject)
             message_id = (email_message['Message-ID'] or '').replace('\n', '').replace('\r', '').strip()
 
+            # Order notifications from own email -> always skip silently
+            own_email = self.config.get('email', '').lower()
+            if own_email and sender.lower() == own_email:
+                order_keywords = self.config.get('order_keywords', [])
+                combined_text = f"{subject} {content}".lower()
+                if any(kw.lower() in combined_text for kw in order_keywords):
+                    print(f"Filtering order notification from own address: {subject[:60]}")
+                    continue
+
             # Check blacklist and filters
-            # BUT: Don't filter if there's already a conversation with this sender
-            # (e.g., customer replying to our manual response to their order confirmation)
+            # Don't filter if there's already a conversation with this sender
             has_conversation = self._db_has_conversation(sender)
 
             if self.is_blacklisted(sender, subject, content) and not has_conversation:
-                # Check what type of blocked email this is
-                combined_text = f"{subject} {content}".lower()
-
-                # Order confirmations: keep in inbox (no draft)
-                order_keywords = self.config.get('order_keywords', [])
-                is_order = any(kw.lower() in combined_text for kw in order_keywords)
-
-                # DELETE everything EXCEPT order confirmations
-                if not is_order:
-                    # Move spam to Junk folder
-                    print(f"Moving spam from {sender} to Junk")
-                    self.move_to_junk(num)
-                    continue
-                else:
-                    # Only keep order confirmations in inbox (no draft generated)
-                    print(f"Filtering (keeping in inbox) order confirmation from {sender}")
-                    continue
+                print(f"Moving spam from {sender} to Junk")
+                self.move_to_junk(num)
+                continue
 
             elif has_conversation:
                 print(f"Not filtering email from {sender} - existing conversation found")
@@ -2274,12 +2268,10 @@ Generate ONLY the title, nothing else. No quotes, no explanation. Example format
                                 continue
 
                             if category == 'order_notification':
-                                has_conv = self._db_has_conversation(email_data['sender'])
-                                if not has_conv:
-                                    print(f"  Triage: order_notification, no conversation, skipping")
-                                    if message_id:
-                                        self._db_mark_processed(message_id, 'incoming')
-                                    continue
+                                print(f"  Triage: order_notification, skipping")
+                                if message_id:
+                                    self._db_mark_processed(message_id, 'incoming')
+                                continue
 
                         # All real emails -> pending for human decision via Matrix
                         pid = self._save_pending_decision(email_data, triage if triage_enabled else {'category': 'unclassified', 'confidence': 0, 'reason': ''})
