@@ -677,7 +677,7 @@ Classify the incoming email into exactly ONE category:
 
 IMPORTANT: If the sender is the same as the business email (info@yourdevice.ch), this is a CONTACT FORM submission from a potential customer - classify based on the actual question content, never as spam or ignore.
 
-Respond with ONLY a JSON object, no other text: {"category": "...", "confidence": 0.XX, "reason": "..."}"""
+Antworte NUR mit einem JSON-Objekt, kein anderer Text. Schreibe den reason auf Deutsch: {"category": "...", "confidence": 0.XX, "reason": "..."}"""
 
             content_preview = email_data['content'][:500] if email_data['content'] else ''
             user_message = f"""Sender: {email_data['sender']}
