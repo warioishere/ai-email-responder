@@ -588,13 +588,14 @@ class EmailAssistant:
             subject = self.decode_mime_header(raw_subject)
             message_id = (email_message['Message-ID'] or '').replace('\n', '').replace('\r', '').strip()
 
-            # Order notifications from own email -> always skip silently
+            # System emails from own address (orders, comments, etc) -> always skip
             own_email = self.config.get('email', '').lower()
             if own_email and sender.lower() == own_email:
                 order_keywords = self.config.get('order_keywords', [])
+                ignore_keywords = self.config.get('own_email_ignore_keywords', ['kommentar', 'comment'])
                 combined_text = f"{subject} {content}".lower()
-                if any(kw.lower() in combined_text for kw in order_keywords):
-                    print(f"Filtering order notification from own address: {subject[:60]}")
+                if any(kw.lower() in combined_text for kw in order_keywords + ignore_keywords):
+                    print(f"Filtering system email from own address: {subject[:60]}")
                     continue
 
             # Check blacklist and filters
