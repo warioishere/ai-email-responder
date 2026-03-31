@@ -1307,46 +1307,78 @@ Inhalt: {email_data['content']}"""
         except:
             return header_value.strip()
 
-    def _extract_text_content(self, email_message) -> str:
-        """Extract plain text content from an email.message.Message object.
-        Handles multipart messages, UTF-8 decoding with fallback encodings."""
-        if email_message.is_multipart():
-            content = ''
-            for part in email_message.walk():
-                if part.get_content_type() == "text/plain":
-                    try:
-                        payload = part.get_payload(decode=True)
-                        if payload:
-                            try:
-                                content += payload.decode('utf-8')
-                            except UnicodeDecodeError:
-                                for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
-                                    try:
-                                        content += payload.decode(encoding)
-                                        break
-                                    except UnicodeDecodeError:
-                                        continue
-                                else:
-                                    content += payload.decode('utf-8', errors='ignore')
-                    except:
-                        pass
-            return content
-        else:
+    def _html_to_text(self, html: str) -> str:
+        """Convert HTML to plain text using stdlib html.parser."""
+        from html.parser import HTMLParser
+        from html import unescape
+
+        class _Strip(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.parts = []
+                self._skip = False
+            def handle_starttag(self, tag, attrs):
+                if tag in ('script', 'style'):
+                    self._skip = True
+                elif tag in ('br', 'p', 'div', 'tr', 'li', 'h1', 'h2', 'h3', 'h4'):
+                    self.parts.append('\n')
+            def handle_endtag(self, tag):
+                if tag in ('script', 'style'):
+                    self._skip = False
+                elif tag in ('p', 'div', 'table', 'ul', 'ol'):
+                    self.parts.append('\n')
+            def handle_data(self, data):
+                if not self._skip:
+                    self.parts.append(data)
+
+        parser = _Strip()
+        parser.feed(unescape(html))
+        text = ''.join(parser.parts)
+        # Collapse whitespace but keep line breaks
+        text = re.sub(r'[^\S\n]+', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    def _decode_payload(self, part) -> str:
+        """Decode an email part payload to string with encoding fallbacks."""
+        payload = part.get_payload(decode=True)
+        if not payload:
+            return ''
+        charset = part.get_content_charset() or 'utf-8'
+        for enc in [charset, 'utf-8', 'iso-8859-1', 'windows-1252']:
             try:
-                payload = email_message.get_payload(decode=True)
-                if payload:
-                    try:
-                        return payload.decode('utf-8')
-                    except UnicodeDecodeError:
-                        for encoding in ['iso-8859-1', 'windows-1252', 'latin-1']:
-                            try:
-                                return payload.decode(encoding)
-                            except UnicodeDecodeError:
-                                continue
-                        return payload.decode('utf-8', errors='ignore')
-                return ''
-            except:
-                return ''
+                return payload.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return payload.decode('utf-8', errors='ignore')
+
+    def _extract_text_content(self, email_message) -> str:
+        """Extract text content from email. Prefers text/plain, falls back to HTML conversion."""
+        plain_parts = []
+        html_parts = []
+
+        if email_message.is_multipart():
+            for part in email_message.walk():
+                ctype = part.get_content_type()
+                if ctype == 'text/plain':
+                    plain_parts.append(self._decode_payload(part))
+                elif ctype == 'text/html':
+                    html_parts.append(self._decode_payload(part))
+        else:
+            ctype = email_message.get_content_type()
+            decoded = self._decode_payload(email_message)
+            if ctype == 'text/plain':
+                plain_parts.append(decoded)
+            elif ctype == 'text/html':
+                html_parts.append(decoded)
+            else:
+                plain_parts.append(decoded)
+
+        if plain_parts:
+            return ''.join(plain_parts)
+        if html_parts:
+            return self._html_to_text(''.join(html_parts))
+        return ''
 
     def remove_markdown(self, text: str) -> str:
         """Remove markdown formatting from text."""
