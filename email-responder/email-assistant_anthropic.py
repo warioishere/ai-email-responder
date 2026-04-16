@@ -537,15 +537,8 @@ class EmailAssistant:
             print(f"Email from {sender} filtered out (learned spam sender)")
             return True
 
-        # Check for order-related keywords
-        order_keywords = self.config.get('order_keywords', [])
-        combined_text = f"{subject} {content}".lower()
-        for keyword in order_keywords:
-            if keyword.lower() in combined_text:
-                print(f"Email from {sender} filtered out (order keyword: {keyword})")
-                return True
-
         # Check for advertising keywords
+        combined_text = f"{subject} {content}".lower()
         ad_keywords = self.config.get('ad_keywords', [])
         for keyword in ad_keywords:
             if keyword.lower() in combined_text:
